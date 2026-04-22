@@ -1,36 +1,58 @@
+//! Parse the `desc` files that pacman bundles inside `core.db`.
+//!
+//! Each package in an Archlinux repository ships a small text file named
+//! `desc` inside the repo's `.db` tar archive. The file is a sequence of
+//! `%KEY%`-headed blocks followed by one or more value lines. We only care
+//! about `%FILENAME%` (the on-disk package name) and `%CSIZE%` (the compressed
+//! size), enough to pick the largest package for the download test.
+
 use snafu::{OptionExt, ResultExt, Snafu};
 
-/// Archlinux repository entry description.
+/// Subset of an Archlinux package's `desc` metadata: just the fields we need.
 #[derive(Debug, Clone)]
 pub struct EntryDescription {
-    /// File name.
+    /// Package file name (e.g. `automake-1.18.1-1-any.pkg.tar.zst`).
     pub file_name: String,
-    /// Compressed size.
+    /// Compressed package size, in bytes (pacman's `%CSIZE%` field).
     pub size: u64,
 }
 
+/// Errors reported by [`extract_data`].
 #[derive(Debug, Snafu)]
 pub enum ExtractionError {
+    /// The `desc` file didn't contain a `%FILENAME%` block.
     NoFilename,
+    /// The `desc` file didn't contain a `%CSIZE%` block.
     NoCompressedSize,
+    /// A `%KEY%` header was the last line — its value is missing.
     UnexpectedEof,
 
+    /// A value line wasn't valid UTF-8.
     #[snafu(display("Non-utf8 line after {name}: {:?}", String::from_utf8_lossy(line)))]
     NonUtf8 {
+        /// Name of the `%KEY%` whose value failed to decode.
         name: &'static str,
+        /// The raw bytes that failed to decode.
         line: Vec<u8>,
         source: std::str::Utf8Error,
     },
 
+    /// A size value wasn't a valid `u64`.
     #[snafu(display("Invalid size after {name}: {value:?}"))]
     InvalidSize {
+        /// Name of the `%KEY%` whose value failed to parse.
         name: &'static str,
+        /// The raw string we tried to parse.
         value: String,
         source: std::num::ParseIntError,
     },
 }
 
-/// Extracts some data from a 'desc' contents.
+/// Extracts the filename and compressed size from a pacman `desc` blob.
+///
+/// The file format is a sequence of `%KEY%`-headed blocks separated by blank
+/// lines. We only care about `%FILENAME%` and `%CSIZE%`, so other blocks are
+/// skipped. Returns an error if either required block is missing or malformed.
 pub fn extract_data(contents: &[u8]) -> Result<EntryDescription, ExtractionError> {
     let mut file_name = None::<String>;
     let mut compressed_size = None::<u64>;

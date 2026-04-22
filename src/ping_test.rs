@@ -16,21 +16,31 @@ async fn time_to_first_byte_once<T: IntoUrl>(
     Ok(start.elapsed())
 }
 
-/// Repeatedly measures the time-to-first-byte on the given URL.
+/// Repeatedly probes `url` with `HEAD` requests and yields the latency of
+/// each probe.
+///
+/// The stream fires its first probe immediately and then waits `interval`
+/// (±10% jitter) between probes. Each probe is bounded by `until`, so a
+/// stalled request cannot drag the ping phase past its deadline. The stream
+/// terminates once `Instant::now() >= until`.
 ///
 /// # Note
 ///
-/// Requires Tokio runtime!
+/// Requires a Tokio runtime — uses `tokio::time`.
 pub fn ping_url<T: IntoUrl + Clone>(
     client: &reqwest::Client,
     url: T,
     interval: Duration,
     until: Instant,
 ) -> impl Stream<Item = Result<Duration, String>> {
+    // OS-seeded: we only use it for timing jitter, not anything reproducible.
     let mut rng: rand::rngs::StdRng = rand::make_rng();
     futures_util::stream::unfold((true, Instant::now()), move |(is_first, last_request)| {
         let url = url.clone();
         let interval = jitter_duration(interval, 0.1, &mut rng);
+        // `reqwest::Client` is internally `Arc`-based, so cloning is a cheap
+        // refcount bump — cheaper than threading a shared borrow through the
+        // async state machine.
         let client = client.clone();
         async move {
             if Instant::now() >= until {
@@ -41,6 +51,9 @@ pub fn ping_url<T: IntoUrl + Clone>(
                     tokio::time::sleep_until(next_ping.into()).await;
                 }
 
+                // `timeout_at(until, ...)` caps the request at the phase
+                // deadline: a hung connection gets cancelled instead of
+                // bleeding into the next phase.
                 let result =
                     tokio::time::timeout_at(until.into(), time_to_first_byte_once(&client, url))
                         .await

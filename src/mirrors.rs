@@ -92,10 +92,15 @@ pub struct Mirror {
     pub last_sync: Option<time::OffsetDateTime>,
 }
 
+/// Serde helpers for `Option<OffsetDateTime>` fields encoded as ISO-8601.
+///
+/// The `time` crate's built-in `time::serde::iso8601` only handles the
+/// non-optional case; this module wraps it to also accept `null`.
 pub(crate) mod serde_maybe_time {
     use serde::{Deserializer, Serializer};
     use time::OffsetDateTime;
 
+    /// Serializes `Some(datetime)` as an ISO-8601 string and `None` as `null`.
     pub fn serialize<S>(datetime: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -107,6 +112,7 @@ pub(crate) mod serde_maybe_time {
         }
     }
 
+    /// Deserializes `null` as `None` and any ISO-8601 string as `Some(dt)`.
     pub fn deserialize<'a, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
     where
         D: Deserializer<'a>,
@@ -137,6 +143,12 @@ pub(crate) mod serde_maybe_time {
     }
 }
 
+/// Defines a country-code enum with `as_code`, `full_name`, `all`, `FromStr`
+/// and `Display` impls from a `CODE => "Full Name"` list.
+///
+/// Unknown codes (including the empty string) deserialize to `Unknown` rather
+/// than failing, so mirrors reporting exotic country codes don't break
+/// parsing of the whole list.
 macro_rules! countries {
     ( $container:ident: $( $code:ident => $full_name:literal ),* $(,)? ) => {
         /// Known countries.

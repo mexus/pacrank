@@ -64,6 +64,13 @@ fn main() -> Result<(), snafu::Whatever> {
         )
         .init();
 
+    // Three modes of operation:
+    //   - dry-run:   drop to `nobody`, run the discovery, print results.
+    //   - --worker:  same as dry-run but emits JSON to stdout for the parent.
+    //   - default:   (re-)escalate to root, then spawn self with `--worker`,
+    //                read its JSON stdout, and write `/etc/pacman.d/mirrorlist`.
+    // The split keeps network I/O unprivileged while isolating the file
+    // rewrite in a minimal privileged branch.
     if dry_run {
         drop_privileges()?;
         discover_best_mirrors(dl_k, ping_k, country)?;
@@ -82,14 +89,22 @@ fn main() -> Result<(), snafu::Whatever> {
 
         if !nix::unistd::Uid::effective().is_root() {
             // Need escalation!
+            // `ARCH_MIRRORS_ESCALATED` is a loop-breaker: the sudo child sets
+            // it and preserves it across the exec, so if we somehow land here
+            // again with a non-root euid we abort instead of spinning forever.
             snafu::ensure_whatever!(
                 std::env::var("ARCH_MIRRORS_ESCALATED").is_err(),
                 "The privileges has already been escalated, but the effective user is still \
                 non-root. Breaking the cycle!"
             );
             tracing::info!("Escalating privileges with sudo");
+            // Absolute path matches the care taken with `current_exe` above —
+            // a PATH-planted `sudo` must not intercept us.
             let status = Command::new("/usr/bin/sudo")
                 .env("ARCH_MIRRORS_ESCALATED", "1")
+                // Preserve `RUST_LOG` so the user's log-filter survives the
+                // privilege jump; sudo's default env_reset would otherwise
+                // drop it.
                 .arg("--preserve-env=RUST_LOG,ARCH_MIRRORS_ESCALATED")
                 .arg(current_exe)
                 .args(std::env::args().skip(1))
@@ -102,7 +117,11 @@ fn main() -> Result<(), snafu::Whatever> {
         let meta = original
             .metadata()
             .whatever_context("Can't get the mirrorlist's meta")?;
+        // Capture the existing file's permissions so the replacement lands
+        // with the same mode — we never want to broaden access on `/etc`.
         let perm = meta.permissions();
+        // Write into a NamedTempFile in the same directory as the target so
+        // the final `persist()` is an atomic rename on the same filesystem.
         let mut output = tempfile::NamedTempFile::new_in("/etc/pacman.d/")
             .whatever_context("Can't create a temporary file")?;
 
@@ -156,6 +175,11 @@ fn main() -> Result<(), snafu::Whatever> {
     Ok(())
 }
 
+/// Permanently drops the process to the `nobody` user and group.
+///
+/// Used by the worker subprocess before doing any network I/O, so a
+/// vulnerability in the parser or HTTP stack cannot be leveraged to write to
+/// `/etc` or exfiltrate root-readable files.
 fn drop_privileges() -> Result<(), snafu::Whatever> {
     let user = nix::unistd::User::from_name("nobody")
         .whatever_context("System error during 'nobody' user lookup")?
@@ -171,6 +195,8 @@ fn drop_privileges() -> Result<(), snafu::Whatever> {
     Ok(())
 }
 
+/// Synchronous wrapper that spins up a Tokio runtime and runs the async
+/// discovery pipeline to completion.
 fn discover_best_mirrors(
     dl_k: NonZeroUsize,
     ping_k: NonZeroUsize,
@@ -183,14 +209,27 @@ fn discover_best_mirrors(
     rt.block_on(discover_best_mirrors_impl(dl_k, ping_k, country))
 }
 
+/// Per-mirror bookkeeping threaded through the discovery pipeline.
+///
+/// The `PING` type parameter encodes the pipeline phase (typestate): during
+/// the latency phase it is [`PingStatRunning`], after statistics are computed
+/// it becomes [`PingStatComputed`].
 struct MirrorData<PING = PingStatRunning> {
     mirror: Mirror,
+    /// Pre-built `lastsync` URL — that endpoint is cheap to HEAD and avoids
+    /// hammering a real package while measuring latency.
     last_sync_url: Url,
     ping_stat: PING,
+    /// Downloaded bytes per second; `NEG_INFINITY` means "not measured yet".
+    /// The sentinel is filtered out before the final ranking.
     dl_speed: f64,
 }
 
 impl MirrorData<PingStatRunning> {
+    /// Builds the bookkeeping for a freshly-fetched [`Mirror`].
+    ///
+    /// Fails if the mirror's URL can't accept the `lastsync` path suffix
+    /// (shouldn't happen for well-formed archlinux.org entries).
     pub fn try_new(mirror: Mirror) -> Result<Self, snafu::Whatever> {
         let last_sync_url = mirror
             .url
@@ -204,6 +243,7 @@ impl MirrorData<PingStatRunning> {
         })
     }
 
+    /// Finalizes the ping statistics and transitions to the post-latency phase.
     pub fn compute_pings<R: ?Sized + Rng>(&self, rng: &mut R) -> MirrorData<PingStatComputed> {
         MirrorData {
             mirror: self.mirror.clone(),
@@ -214,11 +254,26 @@ impl MirrorData<PingStatRunning> {
     }
 }
 
+/// The full discovery pipeline: fetch → filter → latency → throughput → rank.
+///
+/// Phases:
+///   1. Fetch the official mirrors list and filter by country, protocol,
+///      and reasonable freshness.
+///   2. Probe each survivor's `lastsync` endpoint for ~3s to build a
+///      latency distribution; keep the `ping_k` fastest.
+///   3. For each survivor, discover its largest package and measure
+///      throughput over a 2s window; keep the `dl_k` fastest.
+///
+/// Returns the URLs of the final shortlist, already sorted best-first.
 async fn discover_best_mirrors_impl(
     dl_k: std::num::NonZero<usize>,
     ping_k: std::num::NonZero<usize>,
     country: CountryCode,
 ) -> Result<Vec<Url>, snafu::Whatever> {
+    // Single shared client: one connection pool, one UA, one connect timeout
+    // for every outbound request in the pipeline. HTTP keep-alive across
+    // `core.db` → largest-package downloads to the same mirror is a nice
+    // side effect.
     let client = reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(2))
@@ -233,6 +288,9 @@ async fn discover_best_mirrors_impl(
         .await
         .whatever_context("Can't parse mirrors list")?;
     tracing::info!("Fetched {} mirrors", mirrors.urls.len());
+    // 48h is a loose freshness gate: a mirror that's briefly behind during
+    // its own sync cycle might still be the fastest, so we don't want the
+    // cutoff too tight. Anything staler than that is almost certainly broken.
     let max_delay = Duration::from_hours(48);
     let oldest_sync = OffsetDateTime::now_utc() - max_delay;
     let mut ru_list = mirrors
@@ -244,6 +302,9 @@ async fn discover_best_mirrors_impl(
                 && last_sync >= oldest_sync
                 && delay <= max_delay.as_secs()
                 && mirror.country_code == country
+                // Rsync is pacman-compatible via separate tooling, but not
+                // over plain HTTP — skip, since this binary writes
+                // HTTP(S) `Server = ...` lines.
                 && mirror.protocol != Protocol::Rsync
                 && let Ok(mirror_data) = MirrorData::try_new(mirror)
             {
@@ -255,6 +316,8 @@ async fn discover_best_mirrors_impl(
         .collect::<Vec<_>>();
     snafu::ensure_whatever!(!ru_list.is_empty(), "No mirrors available");
     tracing::info!("Discovered {} mirrors for {country}", ru_list.len());
+    // Latency phase deadline: every ping stream stops at `last_ping`, and
+    // individual requests are bounded by the same instant (see `ping_url`).
     let last_ping = Instant::now() + Duration::from_secs(3);
     let streams = ru_list
         .iter()
@@ -285,10 +348,14 @@ async fn discover_best_mirrors_impl(
         }
     }
     tracing::info!("Latency phase finished");
+    // Seeded with a constant so the bootstrap resampling produces the same
+    // confidence intervals for the same inputs across runs — useful when
+    // comparing two invocations made minutes apart.
     let mut rng = rand::rngs::StdRng::seed_from_u64(1337);
     let mut ru_list = ru_list
         .into_iter()
         .map(|data| data.compute_pings(&mut rng))
+        // Anything slower than 1s median is not worth the download test.
         .filter(|data| data.ping_stat.median() <= Duration::from_secs(1))
         .collect::<Vec<_>>();
     snafu::ensure_whatever!(!ru_list.is_empty(), "No servers to continue with");
@@ -321,6 +388,9 @@ async fn discover_best_mirrors_impl(
         .expect("Must be OK"),
     );
     let pb = all_progress.add(dl_progress);
+    // Downloads are deliberately serial: running concurrent downloads would
+    // split the local bandwidth between them and distort each mirror's
+    // measured throughput.
     for data in &mut ru_list {
         mirrors_progress.inc(1);
         match dl_mirror(&client, data, &pb).await {
@@ -336,8 +406,11 @@ async fn discover_best_mirrors_impl(
     pb.finish_and_clear();
     drop(all_progress);
     tracing::info!("DL speed phase finished");
+    // `dl_speed` is still `NEG_INFINITY` for mirrors whose download failed —
+    // drop them before ranking.
     ru_list.retain(|data| data.dl_speed.is_finite());
     snafu::ensure_whatever!(!ru_list.is_empty(), "No servers to continue with");
+    // Faster first: reverse so the largest speed ends up at index 0.
     ru_list.sort_by(|a, b| a.dl_speed.total_cmp(&b.dl_speed).reverse());
     ru_list.truncate(dl_k.get());
     for data in &ru_list {
@@ -351,6 +424,11 @@ async fn discover_best_mirrors_impl(
     Ok(ru_list.into_iter().map(|data| data.mirror.url).collect())
 }
 
+/// Measures the download throughput of a single mirror.
+///
+/// First resolves the largest package via [`largest_file_discovery::discover`]
+/// — which itself downloads and parses `core.db` — then downloads that
+/// package for up to two seconds and returns the observed bytes-per-second.
 async fn dl_mirror<T>(
     client: &reqwest::Client,
     mirror_data: &MirrorData<T>,
