@@ -38,6 +38,16 @@ honest measurement and rewrites the file safely.
 Pick whichever fits your setup. `sudo` is required at run time to rewrite
 `/etc/pacman.d/mirrorlist`, regardless of install method.
 
+**Arch Linux (AUR)** — install the `pacrank-bin` package with your AUR
+helper of choice; it pulls the prebuilt binary from GitHub Releases and
+installs bash / zsh / fish completions automatically:
+
+```
+yay -S pacrank-bin     # or: paru -S pacrank-bin
+```
+
+The PKGBUILD lives in-repo under [`packaging/arch/`](packaging/arch/PKGBUILD).
+
 **Pre-built binary, no Rust needed** — download from the
 [latest GitHub release](https://github.com/mexus/pacrank/releases/latest) and
 drop it on your `PATH`. For the common `x86_64-unknown-linux-gnu` case:
