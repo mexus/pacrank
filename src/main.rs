@@ -130,8 +130,8 @@ fn run_worker(
     country: CountryCode,
 ) -> Result<(), snafu::Whatever> {
     drop_privileges()?;
-    let result =
-        discover_best_mirrors(dl_k, ping_k, country).map_err(|e| DisplayErrorChain::new(e).to_string());
+    let result = discover_best_mirrors(dl_k, ping_k, country)
+        .map_err(|e| DisplayErrorChain::new(e).to_string());
     serde_json::to_writer(std::io::stdout(), &result)
         .whatever_context("Failed to serialize the result")?;
     Ok(())
@@ -288,19 +288,25 @@ fn discover_best_mirrors(
 
 /// Per-mirror bookkeeping threaded through the discovery pipeline.
 ///
-/// The `PING` type parameter encodes the pipeline phase (typestate): during
-/// the latency phase it is [`PingStatRunning`], after statistics are computed
-/// it becomes [`PingStatComputed`].
-struct MirrorData<PING = PingStatRunning> {
+/// Two independent typestate parameters track pipeline progress:
+///
+/// - `PING` — [`PingStatRunning`] during the latency phase,
+///   [`PingStatComputed`] after statistics are bootstrapped.
+/// - `DL` — `Option<f64>` while throughput is being measured (some mirrors
+///   will fail to produce a number), bare `f64` after ranking has filtered
+///   out the failures; the latter makes "has a measured speed" a
+///   compile-time guarantee.
+struct MirrorData<PING = PingStatRunning, DL = Option<f64>> {
     mirror: Mirror,
     /// Pre-built `lastsync` URL — that endpoint is cheap to HEAD and avoids
     /// hammering a real package while measuring latency.
     last_sync_url: Url,
     ping_stat: PING,
-    /// Downloaded bytes per second; `None` until the throughput phase
-    /// records a successful measurement. Mirrors still carrying `None` after
-    /// that phase are filtered out before ranking.
-    dl_speed: Option<f64>,
+    /// Downloaded bytes per second. When `DL = Option<f64>`, `None` means
+    /// "not measured yet" (pre-throughput phase) or "measurement failed"
+    /// (post-throughput, pre-rank). When `DL = f64`, ranking has already
+    /// filtered out missing values.
+    dl_speed: DL,
 }
 
 impl MirrorData<PingStatRunning> {
@@ -329,6 +335,23 @@ impl MirrorData<PingStatRunning> {
             ping_stat: self.ping_stat.compute(rng),
             dl_speed: self.dl_speed,
         }
+    }
+}
+
+impl MirrorData<PingStatComputed, Option<f64>> {
+    /// Lifts the mirror into the "has a measured speed" typestate, or drops
+    /// it entirely if the throughput phase produced no number.
+    ///
+    /// Shaped for use as an [`Iterator::filter_map`] predicate — the `None`
+    /// return filters the mirror out, the `Some(_)` threads it forward with
+    /// `dl_speed: f64`.
+    pub fn into_measured(self) -> Option<MirrorData<PingStatComputed, f64>> {
+        Some(MirrorData {
+            mirror: self.mirror,
+            last_sync_url: self.last_sync_url,
+            ping_stat: self.ping_stat,
+            dl_speed: self.dl_speed?,
+        })
     }
 }
 
@@ -524,33 +547,27 @@ async fn throughput_phase(
 /// Phase 3b: drops mirrors whose download failed, ranks the rest fastest
 /// first, and keeps the top `dl_k`.
 fn rank_by_throughput(
-    mut mirrors: Vec<MirrorData<PingStatComputed>>,
+    mirrors: Vec<MirrorData<PingStatComputed>>,
     dl_k: NonZeroUsize,
-) -> Result<Vec<MirrorData<PingStatComputed>>, snafu::Whatever> {
-    mirrors.retain(|data| data.dl_speed.is_some());
+) -> Result<Vec<MirrorData<PingStatComputed, f64>>, snafu::Whatever> {
+    let mut mirrors = mirrors
+        .into_iter()
+        .filter_map(MirrorData::into_measured)
+        .collect::<Vec<_>>();
     snafu::ensure_whatever!(!mirrors.is_empty(), "No servers to continue with");
-    // `expect` on both sides is safe: we just retained `Some`. Reverse so the
-    // fastest ends up at index 0.
-    mirrors.sort_by(|a, b| {
-        a.dl_speed
-            .expect("retained")
-            .total_cmp(&b.dl_speed.expect("retained"))
-            .reverse()
-    });
+    mirrors.sort_by(|a, b| a.dl_speed.total_cmp(&b.dl_speed).reverse());
     mirrors.truncate(dl_k.get());
     tracing::info!("DL speed phase finished, kept {} mirrors", mirrors.len());
     Ok(mirrors)
 }
 
 /// Prints a one-per-mirror summary of the ranked survivors to stderr.
-fn print_summary(mirrors: &[MirrorData<PingStatComputed>]) {
+fn print_summary(mirrors: &[MirrorData<PingStatComputed, f64>]) {
     for data in mirrors {
         eprintln!(
             "{}:\n  * DL speed: {}\n  * TTFB: {:.2?}",
             data.mirror.url,
-            data.dl_speed
-                .expect("ranked survivors carry a speed")
-                .human_throughput_bytes(),
+            data.dl_speed.human_throughput_bytes(),
             data.ping_stat.median()
         );
     }
