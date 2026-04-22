@@ -36,7 +36,7 @@ struct Args {
     dry_run: bool,
 
     /// Limit mirrors to this country.
-    #[arg(long, short)]
+    #[arg(long, short, value_enum, ignore_case = true)]
     country: CountryCode,
 
     /// Runs a worker that drops privileges, discovers the fastest mirrors and
@@ -53,7 +53,7 @@ fn main() -> Result<(), snafu::Whatever> {
         dry_run,
         worker,
         country,
-    } = Args::parse();
+    } = parse_args();
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
@@ -175,6 +175,25 @@ fn main() -> Result<(), snafu::Whatever> {
     }
 
     Ok(())
+}
+
+/// Parses CLI args, replacing clap's generic "required argument missing"
+/// error with a list of accepted country codes.
+///
+/// `--country` is currently the only required argument, so any
+/// `MissingRequiredArgument` here is about it; revisit if that ever changes.
+fn parse_args() -> Args {
+    match Args::try_parse() {
+        Ok(args) => args,
+        Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {
+            eprintln!("error: --country <COUNTRY> is required. Accepted values:");
+            for cc in CountryCode::all() {
+                eprintln!("  {}: {}", cc.as_code(), cc.full_name());
+            }
+            std::process::exit(2);
+        }
+        Err(e) => e.exit(),
+    }
 }
 
 /// Permanently drops the process to the `nobody` user and group.

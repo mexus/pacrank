@@ -165,9 +165,12 @@ macro_rules! countries {
         }
 
         impl $container {
+            /// All known variants, in declaration order. Excludes `Unknown`.
+            pub const ALL: &'static [Self] = &[ $(Self::$code,)* ];
+
             /// Return all known country codes.
             pub fn all() -> impl ExactSizeIterator<Item = Self> {
-                [ $(Self::$code,)* ].into_iter()
+                Self::ALL.iter().copied()
             }
 
             /// Returns a human-readable country name.
@@ -183,6 +186,21 @@ macro_rules! countries {
                 match self {
                     $( Self::$code => stringify!($code), )*
                     Self::Unknown => "",
+                }
+            }
+        }
+
+        impl clap::ValueEnum for $container {
+            fn value_variants<'a>() -> &'a [Self] {
+                Self::ALL
+            }
+
+            fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+                match self {
+                    // `Unknown` is for deserializing mirrors that report an
+                    // exotic country — we must not let users type it in.
+                    Self::Unknown => None,
+                    _ => Some(clap::builder::PossibleValue::new(self.as_code())),
                 }
             }
         }
