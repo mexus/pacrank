@@ -11,6 +11,11 @@ license = "Apache-2.0 OR MIT"
 keywords = ["archlinux", "pacman", "mirror", "mirrorlist", "cli"]
 categories = ["command-line-utilities", "network-programming"]
 
+[package.metadata.binstall]
+pkg-url = "{repo}/releases/download/v{version}/{name}-{version}-{target}.{archive-format}"
+pkg-fmt = "tgz"
+bin-dir = "{bin}{binary-ext}"
+
 [dependencies]
 camino = "1.2.2"
 clap = { version = "4.6.1", features = ["derive"] }
