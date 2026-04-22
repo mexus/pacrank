@@ -295,7 +295,7 @@ async fn discover_best_mirrors_impl(
     // cutoff too tight. Anything staler than that is almost certainly broken.
     let max_delay = Duration::from_hours(48);
     let oldest_sync = OffsetDateTime::now_utc() - max_delay;
-    let mut ru_list = mirrors
+    let mut mirrors_list = mirrors
         .urls
         .into_iter()
         .filter_map(|mirror| {
@@ -316,12 +316,12 @@ async fn discover_best_mirrors_impl(
             }
         })
         .collect::<Vec<_>>();
-    snafu::ensure_whatever!(!ru_list.is_empty(), "No mirrors available");
-    tracing::info!("Discovered {} mirrors for {country}", ru_list.len());
+    snafu::ensure_whatever!(!mirrors_list.is_empty(), "No mirrors available");
+    tracing::info!("Discovered {} mirrors for {country}", mirrors_list.len());
     // Latency phase deadline: every ping stream stops at `last_ping`, and
     // individual requests are bounded by the same instant (see `ping_url`).
     let last_ping = Instant::now() + Duration::from_secs(3);
-    let streams = ru_list
+    let streams = mirrors_list
         .iter()
         .enumerate()
         .map(|(n, mirror_data)| {
@@ -337,7 +337,7 @@ async fn discover_best_mirrors_impl(
         .collect::<Vec<_>>();
     let mut pings = futures_util::stream::select_all(streams);
     while let Some((n, result)) = pings.next().await {
-        let mirror_data = &mut ru_list[n];
+        let mirror_data = &mut mirrors_list[n];
         match result {
             Ok(duration) => {
                 mirror_data.ping_stat.record_ping(duration);
@@ -349,22 +349,25 @@ async fn discover_best_mirrors_impl(
             }
         }
     }
-    tracing::info!("Latency phase finished");
+    tracing::info!(
+        "Latency phase finished, kept {} mirrors",
+        mirrors_list.len()
+    );
     // Seeded with a constant so the bootstrap resampling produces the same
     // confidence intervals for the same inputs across runs — useful when
     // comparing two invocations made minutes apart.
     let mut rng = rand::rngs::StdRng::seed_from_u64(1337);
-    let mut ru_list = ru_list
+    let mut mirrors_list = mirrors_list
         .into_iter()
         .map(|data| data.compute_pings(&mut rng))
         // Anything slower than 1s median is not worth the download test.
         .filter(|data| data.ping_stat.median() <= Duration::from_secs(1))
         .collect::<Vec<_>>();
-    snafu::ensure_whatever!(!ru_list.is_empty(), "No servers to continue with");
-    ru_list.sort_by_key(|m| m.ping_stat.median());
-    ru_list.truncate(ping_k.get());
+    snafu::ensure_whatever!(!mirrors_list.is_empty(), "No servers to continue with");
+    mirrors_list.sort_by_key(|m| m.ping_stat.median());
+    mirrors_list.truncate(ping_k.get());
     if tracing::enabled!(tracing::Level::DEBUG) {
-        for data in &ru_list {
+        for data in &mirrors_list {
             let low = data.ping_stat.low();
             let high = data.ping_stat.high();
             let median = data.ping_stat.median();
@@ -376,7 +379,7 @@ async fn discover_best_mirrors_impl(
     }
     let all_progress = MultiProgress::new();
     let mirrors_progress = all_progress.add(
-        ProgressBar::new(ru_list.len() as u64).with_style(
+        ProgressBar::new(mirrors_list.len() as u64).with_style(
             ProgressStyle::with_template(
                 "Processing {pos:.cyan}/{len:.green} mirror {bar:20.cyan/blue} (elapsed {elapsed}, eta {eta})",
             )
@@ -393,7 +396,7 @@ async fn discover_best_mirrors_impl(
     // Downloads are deliberately serial: running concurrent downloads would
     // split the local bandwidth between them and distort each mirror's
     // measured throughput.
-    for data in &mut ru_list {
+    for data in &mut mirrors_list {
         mirrors_progress.inc(1);
         match dl_mirror(&client, data, &pb).await {
             Ok(speed) => {
@@ -407,15 +410,18 @@ async fn discover_best_mirrors_impl(
     mirrors_progress.finish_and_clear();
     pb.finish_and_clear();
     drop(all_progress);
-    tracing::info!("DL speed phase finished");
+    tracing::info!(
+        "DL speed phase finished, kept {} mirrors",
+        mirrors_list.len()
+    );
     // `dl_speed` is still `NEG_INFINITY` for mirrors whose download failed —
     // drop them before ranking.
-    ru_list.retain(|data| data.dl_speed.is_finite());
-    snafu::ensure_whatever!(!ru_list.is_empty(), "No servers to continue with");
+    mirrors_list.retain(|data| data.dl_speed.is_finite());
+    snafu::ensure_whatever!(!mirrors_list.is_empty(), "No servers to continue with");
     // Faster first: reverse so the largest speed ends up at index 0.
-    ru_list.sort_by(|a, b| a.dl_speed.total_cmp(&b.dl_speed).reverse());
-    ru_list.truncate(dl_k.get());
-    for data in &ru_list {
+    mirrors_list.sort_by(|a, b| a.dl_speed.total_cmp(&b.dl_speed).reverse());
+    mirrors_list.truncate(dl_k.get());
+    for data in &mirrors_list {
         eprintln!(
             "{}:\n  * DL speed: {}\n  * TTFB: {:.2?}",
             data.mirror.url,
@@ -423,7 +429,10 @@ async fn discover_best_mirrors_impl(
             data.ping_stat.median()
         );
     }
-    Ok(ru_list.into_iter().map(|data| data.mirror.url).collect())
+    Ok(mirrors_list
+        .into_iter()
+        .map(|data| data.mirror.url)
+        .collect())
 }
 
 /// Measures the download throughput of a single mirror.
