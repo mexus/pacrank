@@ -24,6 +24,7 @@ use url::Url;
 
 /// Discover the fastest available Archlinux mirrors for the current location.
 #[derive(Debug, Parser)]
+#[command(version)]
 struct Args {
     /// How many servers with the smallest ping to preserve.
     #[arg(long, default_value_t = nonzero!(10usize))]
