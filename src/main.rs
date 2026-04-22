@@ -55,14 +55,7 @@ fn main() -> Result<(), snafu::Whatever> {
         country,
     } = parse_args();
 
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
-        .init();
+    init_tracing();
 
     // Three modes of operation:
     //   - dry-run:   drop to `nobody`, run the discovery, print results.
@@ -72,109 +65,23 @@ fn main() -> Result<(), snafu::Whatever> {
     // The split keeps network I/O unprivileged while isolating the file
     // rewrite in a minimal privileged branch.
     if dry_run {
-        if nix::unistd::Uid::effective().is_root() {
-            drop_privileges()?;
-        }
-        discover_best_mirrors(dl_k, ping_k, country)?;
-        tracing::info!("Refusing to update the mirror list (dry run enabled)");
+        run_dry_run(dl_k, ping_k, country)
     } else if worker {
-        // Worker process.
-        drop_privileges()?;
-        let result = discover_best_mirrors(dl_k, ping_k, country)
-            .map_err(|e| DisplayErrorChain::new(e).to_string());
-        serde_json::to_writer(std::io::stdout(), &result)
-            .whatever_context("Failed to serialize the result")?;
+        run_worker(dl_k, ping_k, country)
     } else {
-        // Main process.
-        let current_exe =
-            std::env::current_exe().whatever_context("Can't get current executable path")?;
-
-        if !nix::unistd::Uid::effective().is_root() {
-            // Need escalation!
-            // `ARCH_MIRRORS_ESCALATED` is a loop-breaker: the sudo child sets
-            // it and preserves it across the exec, so if we somehow land here
-            // again with a non-root euid we abort instead of spinning forever.
-            snafu::ensure_whatever!(
-                std::env::var("ARCH_MIRRORS_ESCALATED").is_err(),
-                "The privileges has already been escalated, but the effective user is still \
-                non-root. Breaking the cycle!"
-            );
-            tracing::info!("Escalating privileges with sudo");
-            // Absolute path matches the care taken with `current_exe` above —
-            // a PATH-planted `sudo` must not intercept us.
-            let status = Command::new("/usr/bin/sudo")
-                .env("ARCH_MIRRORS_ESCALATED", "1")
-                // Preserve `RUST_LOG` so the user's log-filter survives the
-                // privilege jump; sudo's default env_reset would otherwise
-                // drop it.
-                .arg("--preserve-env=RUST_LOG,ARCH_MIRRORS_ESCALATED")
-                .arg(current_exe)
-                .args(std::env::args().skip(1))
-                .status()
-                .whatever_context("Failed to execute sudo; install sudo or re-run as root")?;
-            std::process::exit(status.code().unwrap_or(1));
-        }
-
-        let original = Utf8Path::new("/etc/pacman.d/mirrorlist");
-        let meta = original
-            .metadata()
-            .whatever_context("Can't get the mirrorlist's meta")?;
-        // Capture the existing file's permissions so the replacement lands
-        // with the same mode — we never want to broaden access on `/etc`.
-        let perm = meta.permissions();
-        // Write into a NamedTempFile in the same directory as the target so
-        // the final `persist()` is an atomic rename on the same filesystem.
-        let mut output = tempfile::NamedTempFile::new_in("/etc/pacman.d/")
-            .whatever_context("Can't create a temporary file")?;
-
-        let child = Command::new(current_exe)
-            .args(std::env::args().skip(1))
-            .arg("--worker")
-            .stdout(Stdio::piped())
-            .spawn()
-            .whatever_context("Can't spawn an unprivileged worker")?;
-        let worker_output = child
-            .wait_with_output()
-            .whatever_context("Can't receive output from the worker")?;
-
-        let stdout = String::from_utf8_lossy(&worker_output.stdout);
-
-        if !worker_output.status.success() {
-            if let Some(code) = worker_output.status.code() {
-                snafu::whatever!("The worker has terminated with code {code}; stdout:\n{stdout}")
-            } else {
-                snafu::whatever!("The worker has terminated with error; stdout:\n{stdout}");
-            }
-        } else {
-            let mirrors = serde_json::from_str::<Result<Vec<Url>, String>>(&stdout)
-                .with_whatever_context(|_| format!("Unable to parse the stdout:\n{stdout:?}"))?
-                .whatever_context("Discovering the best mirrors has failed")?;
-            for url in &mirrors {
-                use std::io::Write;
-                writeln!(
-                    output,
-                    "Server = {}",
-                    url.join("$repo/os/$arch").expect("Should be OK")
-                )
-                .whatever_context("Can't write a mirror")?;
-            }
-            output
-                .as_file()
-                .sync_all()
-                .whatever_context("Can't sync temporary file")?;
-            tracing::debug!("Temporary file populated");
-            output
-                .as_file()
-                .set_permissions(perm)
-                .whatever_context("Unable to update permissions of the temporary file")?;
-            output
-                .persist("/etc/pacman.d/mirrorlist")
-                .whatever_context("Unable to persist the mirror list")?;
-            tracing::info!("Mirrors list updated successfully");
-        }
+        run_privileged()
     }
+}
 
-    Ok(())
+fn init_tracing() {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy(),
+        )
+        .init();
 }
 
 /// Parses CLI args, replacing clap's generic "required argument missing"
@@ -196,6 +103,153 @@ fn parse_args() -> Args {
     }
 }
 
+// ---------- Run modes ----------
+
+/// Runs the full discovery pipeline without writing anything.
+///
+/// Drops to `nobody` only if invoked as root, so a non-privileged user can
+/// still `--dry-run` without needing sudo.
+fn run_dry_run(
+    dl_k: NonZeroUsize,
+    ping_k: NonZeroUsize,
+    country: CountryCode,
+) -> Result<(), snafu::Whatever> {
+    if nix::unistd::Uid::effective().is_root() {
+        drop_privileges()?;
+    }
+    discover_best_mirrors(dl_k, ping_k, country)?;
+    tracing::info!("Refusing to update the mirror list (dry run enabled)");
+    Ok(())
+}
+
+/// Unprivileged worker entry point: drops to `nobody`, runs discovery, and
+/// emits the result as JSON on stdout for the parent to consume.
+fn run_worker(
+    dl_k: NonZeroUsize,
+    ping_k: NonZeroUsize,
+    country: CountryCode,
+) -> Result<(), snafu::Whatever> {
+    drop_privileges()?;
+    let result =
+        discover_best_mirrors(dl_k, ping_k, country).map_err(|e| DisplayErrorChain::new(e).to_string());
+    serde_json::to_writer(std::io::stdout(), &result)
+        .whatever_context("Failed to serialize the result")?;
+    Ok(())
+}
+
+/// Privileged parent entry point: make sure we're root, spawn an unprivileged
+/// worker, and atomically replace `/etc/pacman.d/mirrorlist` with the result.
+fn run_privileged() -> Result<(), snafu::Whatever> {
+    escalate_if_needed()?;
+    let mirrors = spawn_worker_and_read_mirrors()?;
+    write_mirrorlist(&mirrors)?;
+    Ok(())
+}
+
+// ---------- Privileged parent helpers ----------
+
+/// Re-execs the process under sudo when the effective UID isn't root.
+///
+/// If escalation happens, this function does not return — it exits the
+/// current process with the sudo child's exit code. On the already-root path
+/// it simply returns `Ok(())`.
+fn escalate_if_needed() -> Result<(), snafu::Whatever> {
+    if nix::unistd::Uid::effective().is_root() {
+        return Ok(());
+    }
+    // `ARCH_MIRRORS_ESCALATED` is a loop-breaker: the sudo child sets it and
+    // preserves it across the exec, so if we somehow land here again with a
+    // non-root euid we abort instead of spinning forever.
+    snafu::ensure_whatever!(
+        std::env::var("ARCH_MIRRORS_ESCALATED").is_err(),
+        "The privileges has already been escalated, but the effective user is still \
+        non-root. Breaking the cycle!"
+    );
+    tracing::info!("Escalating privileges with sudo");
+    let current_exe =
+        std::env::current_exe().whatever_context("Can't get current executable path")?;
+    // Absolute path matches the care taken with `current_exe` — a
+    // PATH-planted `sudo` must not intercept us.
+    let status = Command::new("/usr/bin/sudo")
+        .env("ARCH_MIRRORS_ESCALATED", "1")
+        // Preserve `RUST_LOG` so the user's log-filter survives the
+        // privilege jump; sudo's default env_reset would otherwise drop it.
+        .arg("--preserve-env=RUST_LOG,ARCH_MIRRORS_ESCALATED")
+        .arg(current_exe)
+        .args(std::env::args().skip(1))
+        .status()
+        .whatever_context("Failed to execute sudo; install sudo or re-run as root")?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Spawns this binary with `--worker`, collects its stdout, and decodes the
+/// JSON-encoded list of winning mirror URLs.
+fn spawn_worker_and_read_mirrors() -> Result<Vec<Url>, snafu::Whatever> {
+    let current_exe =
+        std::env::current_exe().whatever_context("Can't get current executable path")?;
+    let child = Command::new(current_exe)
+        .args(std::env::args().skip(1))
+        .arg("--worker")
+        .stdout(Stdio::piped())
+        .spawn()
+        .whatever_context("Can't spawn an unprivileged worker")?;
+    let worker_output = child
+        .wait_with_output()
+        .whatever_context("Can't receive output from the worker")?;
+    let stdout = String::from_utf8_lossy(&worker_output.stdout);
+
+    if !worker_output.status.success() {
+        if let Some(code) = worker_output.status.code() {
+            snafu::whatever!("The worker has terminated with code {code}; stdout:\n{stdout}");
+        } else {
+            snafu::whatever!("The worker has terminated with error; stdout:\n{stdout}");
+        }
+    }
+
+    serde_json::from_str::<Result<Vec<Url>, String>>(&stdout)
+        .with_whatever_context(|_| format!("Unable to parse the stdout:\n{stdout:?}"))?
+        .whatever_context("Discovering the best mirrors has failed")
+}
+
+/// Atomically replaces `/etc/pacman.d/mirrorlist` with pacman-compatible
+/// `Server = ...` lines derived from the given URLs.
+fn write_mirrorlist(mirrors: &[Url]) -> Result<(), snafu::Whatever> {
+    let original = Utf8Path::new("/etc/pacman.d/mirrorlist");
+    let meta = original
+        .metadata()
+        .whatever_context("Can't get the mirrorlist's meta")?;
+    // Capture the existing file's permissions so the replacement lands with
+    // the same mode — we never want to broaden access on `/etc`.
+    let perm = meta.permissions();
+    // Write into a NamedTempFile in the same directory as the target so the
+    // final `persist()` is an atomic rename on the same filesystem.
+    let mut output = tempfile::NamedTempFile::new_in("/etc/pacman.d/")
+        .whatever_context("Can't create a temporary file")?;
+    for url in mirrors {
+        use std::io::Write;
+        writeln!(
+            output,
+            "Server = {}",
+            url.join("$repo/os/$arch").expect("Should be OK")
+        )
+        .whatever_context("Can't write a mirror")?;
+    }
+    output
+        .as_file()
+        .sync_all()
+        .whatever_context("Can't sync temporary file")?;
+    tracing::debug!("Temporary file populated");
+    output
+        .as_file()
+        .set_permissions(perm)
+        .whatever_context("Unable to update permissions of the temporary file")?;
+    output
+        .persist("/etc/pacman.d/mirrorlist")
+        .whatever_context("Unable to persist the mirror list")?;
+    tracing::info!("Mirrors list updated successfully");
+    Ok(())
+}
+
 /// Permanently drops the process to the `nobody` user and group.
 ///
 /// Used by the worker subprocess before doing any network I/O, so a
@@ -215,6 +269,8 @@ fn drop_privileges() -> Result<(), snafu::Whatever> {
         .whatever_context("CRITICAL SECURITY FAILURE: Could not drop user privileges")?;
     Ok(())
 }
+
+// ---------- Discovery pipeline ----------
 
 /// Synchronous wrapper that spins up a Tokio runtime and runs the async
 /// discovery pipeline to completion.
@@ -241,9 +297,10 @@ struct MirrorData<PING = PingStatRunning> {
     /// hammering a real package while measuring latency.
     last_sync_url: Url,
     ping_stat: PING,
-    /// Downloaded bytes per second; `NEG_INFINITY` means "not measured yet".
-    /// The sentinel is filtered out before the final ranking.
-    dl_speed: f64,
+    /// Downloaded bytes per second; `None` until the throughput phase
+    /// records a successful measurement. Mirrors still carrying `None` after
+    /// that phase are filtered out before ranking.
+    dl_speed: Option<f64>,
 }
 
 impl MirrorData<PingStatRunning> {
@@ -260,7 +317,7 @@ impl MirrorData<PingStatRunning> {
             mirror,
             last_sync_url,
             ping_stat: PingStatRunning::default(),
-            dl_speed: f64::NEG_INFINITY,
+            dl_speed: None,
         })
     }
 
@@ -277,29 +334,39 @@ impl MirrorData<PingStatRunning> {
 
 /// The full discovery pipeline: fetch → filter → latency → throughput → rank.
 ///
-/// Phases:
-///   1. Fetch the official mirrors list and filter by country, protocol,
-///      and reasonable freshness.
-///   2. Probe each survivor's `lastsync` endpoint for ~3s to build a
-///      latency distribution; keep the `ping_k` fastest.
-///   3. For each survivor, discover its largest package and measure
-///      throughput over a 2s window; keep the `dl_k` fastest.
-///
-/// Returns the URLs of the final shortlist, already sorted best-first.
+/// Reads top-to-bottom as a recipe; each phase lives in its own function.
 async fn discover_best_mirrors_impl(
-    dl_k: std::num::NonZero<usize>,
-    ping_k: std::num::NonZero<usize>,
+    dl_k: NonZeroUsize,
+    ping_k: NonZeroUsize,
     country: CountryCode,
 ) -> Result<Vec<Url>, snafu::Whatever> {
-    // Single shared client: one connection pool, one UA, one connect timeout
-    // for every outbound request in the pipeline. HTTP keep-alive across
-    // `core.db` → largest-package downloads to the same mirror is a nice
-    // side effect.
-    let client = reqwest::Client::builder()
+    let client = build_client();
+    let mirrors = fetch_and_filter_mirrors(&client, country).await?;
+    let mirrors = latency_phase(&client, mirrors, Duration::from_secs(3)).await;
+    let mirrors = compute_and_filter_pings(mirrors, ping_k)?;
+    let mirrors = throughput_phase(&client, mirrors).await;
+    let mirrors = rank_by_throughput(mirrors, dl_k)?;
+    print_summary(&mirrors);
+    Ok(mirrors.into_iter().map(|data| data.mirror.url).collect())
+}
+
+/// Single shared client for the whole pipeline: one connection pool, one UA,
+/// one connect timeout. HTTP keep-alive across `core.db` → largest-package
+/// downloads to the same mirror is a nice side effect.
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(2))
         .build()
-        .expect("Should be OK");
+        .expect("Should be OK")
+}
+
+/// Phase 1: downloads the official mirrors list and filters it down to
+/// HTTP(S) mirrors in `country` whose last sync is within 48h.
+async fn fetch_and_filter_mirrors(
+    client: &reqwest::Client,
+    country: CountryCode,
+) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
     let Mirrors::V3(mirrors) = client
         .get("https://archlinux.org/mirrors/status/json/")
         .send()
@@ -309,12 +376,13 @@ async fn discover_best_mirrors_impl(
         .await
         .whatever_context("Can't parse mirrors list")?;
     tracing::info!("Fetched {} mirrors", mirrors.urls.len());
+
     // 48h is a loose freshness gate: a mirror that's briefly behind during
     // its own sync cycle might still be the fastest, so we don't want the
     // cutoff too tight. Anything staler than that is almost certainly broken.
     let max_delay = Duration::from_hours(48);
     let oldest_sync = OffsetDateTime::now_utc() - max_delay;
-    let mut mirrors_list = mirrors
+    let kept = mirrors
         .urls
         .into_iter()
         .filter_map(|mirror| {
@@ -335,20 +403,30 @@ async fn discover_best_mirrors_impl(
             }
         })
         .collect::<Vec<_>>();
-    snafu::ensure_whatever!(!mirrors_list.is_empty(), "No mirrors available");
-    tracing::info!("Discovered {} mirrors for {country}", mirrors_list.len());
-    // Latency phase deadline: every ping stream stops at `last_ping`, and
-    // individual requests are bounded by the same instant (see `ping_url`).
-    let last_ping = Instant::now() + Duration::from_secs(3);
-    let streams = mirrors_list
+    snafu::ensure_whatever!(!kept.is_empty(), "No mirrors available");
+    tracing::info!("Discovered {} mirrors for {country}", kept.len());
+    Ok(kept)
+}
+
+/// Phase 2a: probes every mirror's `lastsync` URL for `duration`, recording
+/// per-probe latency (or errors) into each mirror's [`PingStatRunning`].
+async fn latency_phase(
+    client: &reqwest::Client,
+    mut mirrors: Vec<MirrorData<PingStatRunning>>,
+    duration: Duration,
+) -> Vec<MirrorData<PingStatRunning>> {
+    // Deadline shared by every ping stream and by each individual request
+    // (see `ping_url` for the per-request timeout).
+    let deadline = Instant::now() + duration;
+    let streams = mirrors
         .iter()
         .enumerate()
         .map(|(n, mirror_data)| {
             arch_mirrors::ping_test::ping_url(
-                &client,
+                client,
                 mirror_data.last_sync_url.clone(),
                 Duration::from_secs(1),
-                last_ping,
+                deadline,
             )
             .map(move |result| (n, result))
         })
@@ -356,7 +434,7 @@ async fn discover_best_mirrors_impl(
         .collect::<Vec<_>>();
     let mut pings = futures_util::stream::select_all(streams);
     while let Some((n, result)) = pings.next().await {
-        let mirror_data = &mut mirrors_list[n];
+        let mirror_data = &mut mirrors[n];
         match result {
             Ok(duration) => {
                 mirror_data.ping_stat.record_ping(duration);
@@ -368,25 +446,31 @@ async fn discover_best_mirrors_impl(
             }
         }
     }
-    tracing::info!(
-        "Latency phase finished, kept {} mirrors",
-        mirrors_list.len()
-    );
+    mirrors
+}
+
+/// Phase 2b: turns raw ping samples into bootstrap statistics, drops anything
+/// slower than 1s median, then keeps the `ping_k` fastest survivors.
+fn compute_and_filter_pings(
+    mirrors: Vec<MirrorData<PingStatRunning>>,
+    ping_k: NonZeroUsize,
+) -> Result<Vec<MirrorData<PingStatComputed>>, snafu::Whatever> {
     // Seeded with a constant so the bootstrap resampling produces the same
     // confidence intervals for the same inputs across runs — useful when
     // comparing two invocations made minutes apart.
     let mut rng = rand::rngs::StdRng::seed_from_u64(1337);
-    let mut mirrors_list = mirrors_list
+    let mut kept = mirrors
         .into_iter()
         .map(|data| data.compute_pings(&mut rng))
         // Anything slower than 1s median is not worth the download test.
         .filter(|data| data.ping_stat.median() <= Duration::from_secs(1))
         .collect::<Vec<_>>();
-    snafu::ensure_whatever!(!mirrors_list.is_empty(), "No servers to continue with");
-    mirrors_list.sort_by_key(|m| m.ping_stat.median());
-    mirrors_list.truncate(ping_k.get());
+    snafu::ensure_whatever!(!kept.is_empty(), "No servers to continue with");
+    kept.sort_by_key(|m| m.ping_stat.median());
+    kept.truncate(ping_k.get());
+    tracing::info!("Latency phase finished, kept {} mirrors", kept.len());
     if tracing::enabled!(tracing::Level::DEBUG) {
-        for data in &mirrors_list {
+        for data in &kept {
             let low = data.ping_stat.low();
             let high = data.ping_stat.high();
             let median = data.ping_stat.median();
@@ -396,62 +480,80 @@ async fn discover_best_mirrors_impl(
             );
         }
     }
+    Ok(kept)
+}
+
+/// Phase 3a: measures throughput against each survivor, **serially**.
+///
+/// Running concurrent downloads would split local bandwidth between them
+/// and distort the per-mirror measurement; that's why we don't parallelize.
+async fn throughput_phase(
+    client: &reqwest::Client,
+    mut mirrors: Vec<MirrorData<PingStatComputed>>,
+) -> Vec<MirrorData<PingStatComputed>> {
     let all_progress = MultiProgress::new();
     let mirrors_progress = all_progress.add(
-        ProgressBar::new(mirrors_list.len() as u64).with_style(
+        ProgressBar::new(mirrors.len() as u64).with_style(
             ProgressStyle::with_template(
                 "Processing {pos:.cyan}/{len:.green} mirror {bar:20.cyan/blue} (elapsed {elapsed}, eta {eta})",
             )
             .expect("Template must be OK"),
         ),
     );
-    let dl_progress = ProgressBar::new_spinner().with_style(
-        ProgressStyle::with_template(
-            "{prefix:.cyan}: {elapsed} ({bytes}/{total_bytes}): {bytes_per_sec:.green}",
-        )
-        .expect("Must be OK"),
+    let dl_progress = all_progress.add(
+        ProgressBar::new_spinner().with_style(
+            ProgressStyle::with_template(
+                "{prefix:.cyan}: {elapsed} ({bytes}/{total_bytes}): {bytes_per_sec:.green}",
+            )
+            .expect("Must be OK"),
+        ),
     );
-    let pb = all_progress.add(dl_progress);
-    // Downloads are deliberately serial: running concurrent downloads would
-    // split the local bandwidth between them and distort each mirror's
-    // measured throughput.
-    for data in &mut mirrors_list {
+    for data in &mut mirrors {
         mirrors_progress.inc(1);
-        match dl_mirror(&client, data, &pb).await {
-            Ok(speed) => {
-                data.dl_speed = speed;
-            }
-            Err(e) => {
-                tracing::warn!("{}: {}", data.mirror.url, DisplayErrorChain::new(&e))
-            }
+        match dl_mirror(client, data, &dl_progress).await {
+            Ok(speed) => data.dl_speed = Some(speed),
+            Err(e) => tracing::warn!("{}: {}", data.mirror.url, DisplayErrorChain::new(&e)),
         }
     }
     mirrors_progress.finish_and_clear();
-    pb.finish_and_clear();
+    dl_progress.finish_and_clear();
     drop(all_progress);
-    tracing::info!(
-        "DL speed phase finished, kept {} mirrors",
-        mirrors_list.len()
-    );
-    // `dl_speed` is still `NEG_INFINITY` for mirrors whose download failed —
-    // drop them before ranking.
-    mirrors_list.retain(|data| data.dl_speed.is_finite());
-    snafu::ensure_whatever!(!mirrors_list.is_empty(), "No servers to continue with");
-    // Faster first: reverse so the largest speed ends up at index 0.
-    mirrors_list.sort_by(|a, b| a.dl_speed.total_cmp(&b.dl_speed).reverse());
-    mirrors_list.truncate(dl_k.get());
-    for data in &mirrors_list {
+    mirrors
+}
+
+/// Phase 3b: drops mirrors whose download failed, ranks the rest fastest
+/// first, and keeps the top `dl_k`.
+fn rank_by_throughput(
+    mut mirrors: Vec<MirrorData<PingStatComputed>>,
+    dl_k: NonZeroUsize,
+) -> Result<Vec<MirrorData<PingStatComputed>>, snafu::Whatever> {
+    mirrors.retain(|data| data.dl_speed.is_some());
+    snafu::ensure_whatever!(!mirrors.is_empty(), "No servers to continue with");
+    // `expect` on both sides is safe: we just retained `Some`. Reverse so the
+    // fastest ends up at index 0.
+    mirrors.sort_by(|a, b| {
+        a.dl_speed
+            .expect("retained")
+            .total_cmp(&b.dl_speed.expect("retained"))
+            .reverse()
+    });
+    mirrors.truncate(dl_k.get());
+    tracing::info!("DL speed phase finished, kept {} mirrors", mirrors.len());
+    Ok(mirrors)
+}
+
+/// Prints a one-per-mirror summary of the ranked survivors to stderr.
+fn print_summary(mirrors: &[MirrorData<PingStatComputed>]) {
+    for data in mirrors {
         eprintln!(
             "{}:\n  * DL speed: {}\n  * TTFB: {:.2?}",
             data.mirror.url,
-            data.dl_speed.human_throughput_bytes(),
+            data.dl_speed
+                .expect("ranked survivors carry a speed")
+                .human_throughput_bytes(),
             data.ping_stat.median()
         );
     }
-    Ok(mirrors_list
-        .into_iter()
-        .map(|data| data.mirror.url)
-        .collect())
 }
 
 /// Measures the download throughput of a single mirror.
