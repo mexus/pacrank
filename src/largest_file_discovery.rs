@@ -6,7 +6,7 @@
 //! `desc` files), walk the archive, and return the URL of the package with
 //! the largest `%CSIZE%`.
 
-use std::io::Read;
+use std::{io::Read, time::Duration};
 
 use camino::Utf8Path;
 use display_error_chain::DisplayErrorChain;
@@ -61,12 +61,17 @@ pub enum DiscoveryError {
 ///
 /// Downloads `core/os/x86_64/core.db` from the given mirror, scans every
 /// `desc` entry for its `%CSIZE%`, and returns the URL of the winner.
-pub async fn discover(client: &reqwest::Client, repo_url: &Url) -> Result<Url, DiscoveryError> {
+pub async fn discover(
+    client: &reqwest::Client,
+    repo_url: &Url,
+    time_limit: Duration,
+) -> Result<Url, DiscoveryError> {
     let core_db_url = repo_url
         .join("core/os/x86_64/core.db")
         .context(InvalidCoreUrlSnafu)?;
     let response = client
         .get(core_db_url.as_str())
+        .timeout(time_limit)
         .send()
         .await
         .context(RequestFailedSnafu {

@@ -38,7 +38,12 @@ where
     U: IntoUrl,
     C: ProgressCallback,
 {
-    let mut response = client.get(url).send().await?.error_for_status()?;
+    let mut response = client
+        .get(url)
+        // .timeout(time_limit)
+        .send()
+        .await?
+        .error_for_status()?;
     // A 0 here typically means "unknown" (chunked transfer) rather than
     // "empty response", so we treat it the same as a missing header.
     let maybe_length = response.content_length().filter(|len| *len != 0);

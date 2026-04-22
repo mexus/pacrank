@@ -1,7 +1,7 @@
 # arch-mirrors
 
-Pick the fastest Archlinux mirrors in a country and write them to
-`/etc/pacman.d/mirrorlist`.
+Pick the fastest Archlinux mirrors for one or more countries and write them
+to `/etc/pacman.d/mirrorlist`.
 
 Fetches the official mirrors list, filters by country and freshness, pings
 each candidate a few times, downloads the largest package from `core` on
@@ -21,6 +21,14 @@ sudo prompts for your password (see [Privileges](#privileges) below),
 the latency and download phases run, and `/etc/pacman.d/mirrorlist`
 is rewritten with the top picks.
 
+Pass `--country` multiple times to pool candidates across countries — useful
+near a border or when one country has few mirrors. `--ping-k` and `--dl-k`
+remain **global** caps applied to the combined pool, not per-country:
+
+```
+arch-mirrors --country DE --country NL --country FR
+```
+
 Dry run — no sudo, nothing written:
 
 ```
@@ -29,8 +37,9 @@ arch-mirrors --country BR --dry-run
 
 ## Options
 
-- `--country <CC>` — ISO country code filter (`RU` for Russia, `CN` for China,
-  `DE` for Germany, `US` for the USA and so on)
+- `--country <CC>` / `-c <CC>` — ISO country code filter (`RU` for Russia,
+  `CN` for China, `DE` for Germany, `US` for the USA and so on). Repeat the
+  flag to pool mirrors from several countries, e.g. `-c US -c CA`.
 - `--ping-k N` — keep the N lowest-latency mirrors after the ping phase (default 10)
 - `--dl-k N` — keep the N fastest-download mirrors for the final list (default 5)
 - `--dry-run` — run both phases, print results, don't touch the mirrorlist

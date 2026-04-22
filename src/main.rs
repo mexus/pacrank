@@ -35,9 +35,10 @@ struct Args {
     #[arg(long, short)]
     dry_run: bool,
 
-    /// Limit mirrors to this country.
-    #[arg(long, short, value_enum, ignore_case = true)]
-    country: CountryCode,
+    /// Limit mirrors to these countries. Pass the flag multiple times for
+    /// more than one (e.g. `-c US -c DE`).
+    #[arg(long, short, value_enum, ignore_case = true, required = true)]
+    country: Vec<CountryCode>,
 
     /// Runs a worker that drops privileges, discovers the fastest mirrors and
     /// reports them back.
@@ -65,9 +66,9 @@ fn main() -> Result<(), snafu::Whatever> {
     // The split keeps network I/O unprivileged while isolating the file
     // rewrite in a minimal privileged branch.
     if dry_run {
-        run_dry_run(dl_k, ping_k, country)
+        run_dry_run(dl_k, ping_k, &country)
     } else if worker {
-        run_worker(dl_k, ping_k, country)
+        run_worker(dl_k, ping_k, &country)
     } else {
         run_privileged()
     }
@@ -93,7 +94,10 @@ fn parse_args() -> Args {
     match Args::try_parse() {
         Ok(args) => args,
         Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {
-            eprintln!("error: --country <COUNTRY> is required. Accepted values:");
+            eprintln!(
+                "error: at least one --country <COUNTRY> is required \
+                 (repeat the flag for more than one). Accepted values:"
+            );
             for cc in CountryCode::all() {
                 eprintln!("  {}: {}", cc.as_code(), cc.full_name());
             }
@@ -112,12 +116,12 @@ fn parse_args() -> Args {
 fn run_dry_run(
     dl_k: NonZeroUsize,
     ping_k: NonZeroUsize,
-    country: CountryCode,
+    countries: &[CountryCode],
 ) -> Result<(), snafu::Whatever> {
     if nix::unistd::Uid::effective().is_root() {
         drop_privileges()?;
     }
-    discover_best_mirrors(dl_k, ping_k, country)?;
+    discover_best_mirrors(dl_k, ping_k, countries)?;
     tracing::info!("Refusing to update the mirror list (dry run enabled)");
     Ok(())
 }
@@ -127,10 +131,10 @@ fn run_dry_run(
 fn run_worker(
     dl_k: NonZeroUsize,
     ping_k: NonZeroUsize,
-    country: CountryCode,
+    countries: &[CountryCode],
 ) -> Result<(), snafu::Whatever> {
     drop_privileges()?;
-    let result = discover_best_mirrors(dl_k, ping_k, country)
+    let result = discover_best_mirrors(dl_k, ping_k, countries)
         .map_err(|e| DisplayErrorChain::new(e).to_string());
     serde_json::to_writer(std::io::stdout(), &result)
         .whatever_context("Failed to serialize the result")?;
@@ -277,13 +281,13 @@ fn drop_privileges() -> Result<(), snafu::Whatever> {
 fn discover_best_mirrors(
     dl_k: NonZeroUsize,
     ping_k: NonZeroUsize,
-    country: CountryCode,
+    countries: &[CountryCode],
 ) -> Result<Vec<Url>, snafu::Whatever> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .whatever_context("Can't initialize Tokio")?;
-    rt.block_on(discover_best_mirrors_impl(dl_k, ping_k, country))
+    rt.block_on(discover_best_mirrors_impl(dl_k, ping_k, countries))
 }
 
 /// Per-mirror bookkeeping threaded through the discovery pipeline.
@@ -361,10 +365,10 @@ impl MirrorData<PingStatComputed, Option<f64>> {
 async fn discover_best_mirrors_impl(
     dl_k: NonZeroUsize,
     ping_k: NonZeroUsize,
-    country: CountryCode,
+    countries: &[CountryCode],
 ) -> Result<Vec<Url>, snafu::Whatever> {
     let client = build_client();
-    let mirrors = fetch_and_filter_mirrors(&client, country).await?;
+    let mirrors = fetch_and_filter_mirrors(&client, countries).await?;
     let mirrors = latency_phase(&client, mirrors, Duration::from_secs(3)).await;
     let mirrors = compute_and_filter_pings(mirrors, ping_k)?;
     let mirrors = throughput_phase(&client, mirrors).await;
@@ -385,10 +389,10 @@ fn build_client() -> reqwest::Client {
 }
 
 /// Phase 1: downloads the official mirrors list and filters it down to
-/// HTTP(S) mirrors in `country` whose last sync is within 48h.
+/// HTTP(S) mirrors in any of `countries` whose last sync is within 48h.
 async fn fetch_and_filter_mirrors(
     client: &reqwest::Client,
-    country: CountryCode,
+    countries: &[CountryCode],
 ) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
     let Mirrors::V3(mirrors) = client
         .get("https://archlinux.org/mirrors/status/json/")
@@ -413,7 +417,7 @@ async fn fetch_and_filter_mirrors(
                 && let Some(delay) = mirror.delay
                 && last_sync >= oldest_sync
                 && delay <= max_delay.as_secs()
-                && mirror.country_code == country
+                && countries.contains(&mirror.country_code)
                 // Rsync is pacman-compatible via separate tooling, but not
                 // over plain HTTP — skip, since this binary writes
                 // HTTP(S) `Server = ...` lines.
@@ -427,8 +431,21 @@ async fn fetch_and_filter_mirrors(
         })
         .collect::<Vec<_>>();
     snafu::ensure_whatever!(!kept.is_empty(), "No mirrors available");
-    tracing::info!("Discovered {} mirrors for {country}", kept.len());
+    tracing::info!(
+        "Discovered {} mirrors for {}",
+        kept.len(),
+        format_countries(countries),
+    );
     Ok(kept)
+}
+
+/// Renders a slice of country codes as a comma-separated list for log output.
+fn format_countries(countries: &[CountryCode]) -> String {
+    countries
+        .iter()
+        .map(CountryCode::as_code)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Phase 2a: probes every mirror's `lastsync` URL for `duration`, recording
@@ -583,8 +600,10 @@ async fn dl_mirror<T>(
     mirror_data: &MirrorData<T>,
     dl_progress: &ProgressBar,
 ) -> Result<f64, snafu::Whatever> {
+    const TIME_LIMIT: Duration = Duration::from_secs(2);
+
     let largest_file_url =
-        arch_mirrors::largest_file_discovery::discover(client, &mirror_data.mirror.url)
+        arch_mirrors::largest_file_discovery::discover(client, &mirror_data.mirror.url, TIME_LIMIT)
             .await
             .whatever_context("Failed to discover the largest file")?;
     dl_progress.set_prefix(mirror_data.mirror.url.to_string());
@@ -598,10 +617,13 @@ async fn dl_mirror<T>(
             }
             dl_progress.set_position(downloaded);
         },
-        Duration::from_secs(2),
+        TIME_LIMIT,
     )
     .await;
-    let (bytes, time) = result.whatever_context("Failed to download the largest file")?;
+    dl_progress.reset();
+    let (bytes, time) = result.with_whatever_context(|_| {
+        format!("Failed to download the largest file {largest_file_url}")
+    })?;
     let speed = bytes as f64 / time.as_secs_f64();
     tracing::debug!(
         "{}: {bytes} bytes in {time:.2?}, speed = {:.2} KB/s",
