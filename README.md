@@ -1,4 +1,4 @@
-# arch-mirrors
+# pacrank
 
 Pick the fastest Archlinux mirrors for one or more countries and write them
 to `/etc/pacman.d/mirrorlist`.
@@ -14,7 +14,7 @@ Needs Rust 1.91+ (edition 2024) and `sudo`.
 
 ```
 cargo install --path .
-arch-mirrors --country BR
+pacrank --country BR
 ```
 
 sudo prompts for your password (see [Privileges](#privileges) below),
@@ -26,13 +26,13 @@ near a border or when one country has few mirrors. `--ping-k` and `--dl-k`
 remain **global** caps applied to the combined pool, not per-country:
 
 ```
-arch-mirrors --country DE --country NL --country FR
+pacrank --country DE --country NL --country FR
 ```
 
 Dry run — no sudo, nothing written:
 
 ```
-arch-mirrors --country BR --dry-run
+pacrank --country BR --dry-run
 ```
 
 ## Options
@@ -65,7 +65,7 @@ confined to the file write itself:
    write to a `NamedTempFile` in `/etc/pacman.d/`, `fsync`, copy the old
    file's mode onto it, `rename(2)` into place.
 
-An `ARCH_MIRRORS_ESCALATED` env var is set on the sudo child and checked
+A `PACRANK_ESCALATED` env var is set on the sudo child and checked
 on the way in to break any hypothetical escalation loop.
 
 Already root? Step 1 is skipped and execution jumps straight to step 2.

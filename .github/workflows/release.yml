@@ -29,8 +29,8 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           target="x86_64-unknown-linux-gnu"
-          archive="arch-mirrors-${version}-${target}.tar.gz"
-          tar -C target/release -czf "$archive" arch-mirrors
+          archive="pacrank-${version}-${target}.tar.gz"
+          tar -C target/release -czf "$archive" pacrank
           sha256sum "$archive" > "$archive.sha256"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 

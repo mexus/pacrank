@@ -1,12 +1,12 @@
 [package]
-name = "arch-mirrors"
+name = "pacrank"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["mexus"]
 description = "Pick the fastest Archlinux mirrors (I use Arch btw)"
 readme = "README.md"
-repository = "https://github.com/mexus/arch-mirrors"
+repository = "https://github.com/mexus/pacrank"
 license = "Apache-2.0 OR MIT"
 keywords = ["archlinux", "pacman", "mirror", "mirrorlist", "cli"]
 categories = ["command-line-utilities", "network-programming"]

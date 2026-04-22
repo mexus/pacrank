@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use arch_mirrors::{
+use pacrank::{
     APP_USER_AGENT, CountryCode, Mirror, Mirrors, Protocol,
     ping_stat::{PingStatComputed, PingStatRunning},
 };
@@ -161,11 +161,11 @@ fn escalate_if_needed() -> Result<(), snafu::Whatever> {
     if nix::unistd::Uid::effective().is_root() {
         return Ok(());
     }
-    // `ARCH_MIRRORS_ESCALATED` is a loop-breaker: the sudo child sets it and
+    // `PACRANK_ESCALATED` is a loop-breaker: the sudo child sets it and
     // preserves it across the exec, so if we somehow land here again with a
     // non-root euid we abort instead of spinning forever.
     snafu::ensure_whatever!(
-        std::env::var("ARCH_MIRRORS_ESCALATED").is_err(),
+        std::env::var("PACRANK_ESCALATED").is_err(),
         "The privileges has already been escalated, but the effective user is still \
         non-root. Breaking the cycle!"
     );
@@ -175,10 +175,10 @@ fn escalate_if_needed() -> Result<(), snafu::Whatever> {
     // Absolute path matches the care taken with `current_exe` — a
     // PATH-planted `sudo` must not intercept us.
     let status = Command::new("/usr/bin/sudo")
-        .env("ARCH_MIRRORS_ESCALATED", "1")
+        .env("PACRANK_ESCALATED", "1")
         // Preserve `RUST_LOG` so the user's log-filter survives the
         // privilege jump; sudo's default env_reset would otherwise drop it.
-        .arg("--preserve-env=RUST_LOG,ARCH_MIRRORS_ESCALATED")
+        .arg("--preserve-env=RUST_LOG,PACRANK_ESCALATED")
         .arg(current_exe)
         .args(std::env::args().skip(1))
         .status()
@@ -462,7 +462,7 @@ async fn latency_phase(
         .iter()
         .enumerate()
         .map(|(n, mirror_data)| {
-            arch_mirrors::ping_test::ping_url(
+            pacrank::ping_test::ping_url(
                 client,
                 mirror_data.last_sync_url.clone(),
                 Duration::from_secs(1),
@@ -603,12 +603,12 @@ async fn dl_mirror<T>(
     const TIME_LIMIT: Duration = Duration::from_secs(2);
 
     let largest_file_url =
-        arch_mirrors::largest_file_discovery::discover(client, &mirror_data.mirror.url, TIME_LIMIT)
+        pacrank::largest_file_discovery::discover(client, &mirror_data.mirror.url, TIME_LIMIT)
             .await
             .whatever_context("Failed to discover the largest file")?;
     dl_progress.set_prefix(mirror_data.mirror.url.to_string());
     dl_progress.reset();
-    let result = arch_mirrors::dl_test::download(
+    let result = pacrank::dl_test::download(
         client,
         largest_file_url.clone(),
         |downloaded, maybe_length| {
