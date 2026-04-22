@@ -27,9 +27,8 @@ jobs:
       - name: Package
         id: pkg
         run: |
-          version="${GITHUB_REF_NAME#v}"
           target="x86_64-unknown-linux-gnu"
-          archive="pacrank-${version}-${target}.tar.gz"
+          archive="pacrank-${target}.tar.gz"
           tar -C target/release -czf "$archive" pacrank
           sha256sum "$archive" > "$archive.sha256"
           echo "archive=$archive" >> "$GITHUB_OUTPUT"

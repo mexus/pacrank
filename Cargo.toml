@@ -12,7 +12,7 @@ keywords = ["archlinux", "pacman", "mirror", "mirrorlist", "cli"]
 categories = ["command-line-utilities", "network-programming"]
 
 [package.metadata.binstall]
-pkg-url = "{repo}/releases/download/v{version}/{name}-{version}-{target}.{archive-format}"
+pkg-url = "{repo}/releases/download/v{version}/{name}-{target}.{archive-format}"
 pkg-fmt = "tgz"
 bin-dir = "{bin}{binary-ext}"
 

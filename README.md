@@ -35,11 +35,22 @@ honest measurement and rewrites the file safely.
 
 ## Installation
 
-Pick whichever you have tooling for — each lands a `pacrank` binary in
-`~/.cargo/bin`. `sudo` is required at run time to rewrite
+Pick whichever fits your setup. `sudo` is required at run time to rewrite
 `/etc/pacman.d/mirrorlist`, regardless of install method.
 
-**Pre-built binary via [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall)** — no Rust toolchain needed:
+**Pre-built binary, no Rust needed** — download from the
+[latest GitHub release](https://github.com/mexus/pacrank/releases/latest) and
+drop it on your `PATH`. For the common `x86_64-unknown-linux-gnu` case:
+
+```
+mkdir -p ~/.local/bin
+curl -L https://github.com/mexus/pacrank/releases/latest/download/pacrank-x86_64-unknown-linux-gnu.tar.gz \
+  | tar -xz -C ~/.local/bin
+```
+
+Make sure `~/.local/bin` is on your `PATH`.
+
+**Pre-built binary via [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall)** — needs `cargo` on your `PATH` but skips the compile step:
 
 ```
 cargo binstall pacrank
