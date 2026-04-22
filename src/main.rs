@@ -35,11 +35,13 @@ struct Args {
     #[arg(long, short)]
     dry_run: bool,
 
+    /// Limit mirrors to this country.
     #[arg(long, short, default_value_t = CountryCode::RU)]
     country: CountryCode,
 
-    #[doc(hidden)]
-    #[arg(long)]
+    /// Runs a worker that drops privileges, discovers the fastest mirrors and
+    /// reports them back.
+    #[arg(long, hide(true))]
     worker: bool,
 }
 
@@ -77,6 +79,24 @@ fn main() -> Result<(), snafu::Whatever> {
         // Main process.
         let current_exe =
             std::env::current_exe().whatever_context("Can't get current executable path")?;
+
+        if !nix::unistd::Uid::effective().is_root() {
+            // Need escalation!
+            snafu::ensure_whatever!(
+                std::env::var("ARCH_MIRRORS_ESCALATED").is_err(),
+                "The privileges has already been escalated, but the effective user is still \
+                non-root. Breaking the cycle!"
+            );
+            tracing::info!("Escalating privileges with sudo");
+            let status = Command::new("/usr/bin/sudo")
+                .env("ARCH_MIRRORS_ESCALATED", "1")
+                .arg("--preserve-env=RUST_LOG,ARCH_MIRRORS_ESCALATED")
+                .arg(current_exe)
+                .args(std::env::args().skip(1))
+                .status()
+                .whatever_context("Failed to execute sudo; install sudo or re-run as root")?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
 
         let original = Utf8Path::new("/etc/pacman.d/mirrorlist");
         let meta = original
