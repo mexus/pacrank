@@ -17,9 +17,7 @@ use url::Url;
 #[derive(Debug, Snafu)]
 pub enum DiscoveryError {
     /// The `core.db` URL couldn't be constructed from the mirror's base URL.
-    InvalidCoreUrl {
-        source: url::ParseError,
-    },
+    InvalidCoreUrl { source: url::ParseError },
     /// The request for `core.db` failed before any response was received.
     RequestFailed {
         /// URL that was requested.
@@ -38,17 +36,11 @@ pub enum DiscoveryError {
         first_bytes: Vec<u8>,
     },
     /// Initializing the zstd decoder failed.
-    OpenZstd {
-        source: std::io::Error,
-    },
+    OpenZstd { source: std::io::Error },
     /// Reading the tar archive's entry index failed.
-    ScanEntries {
-        source: std::io::Error,
-    },
+    ScanEntries { source: std::io::Error },
     /// Advancing to the next tar entry failed.
-    FetchEntry {
-        source: std::io::Error,
-    },
+    FetchEntry { source: std::io::Error },
     /// Reading the body of a tar entry (a `desc` file) failed.
     ReadEntry {
         /// Path of the entry inside the archive.
