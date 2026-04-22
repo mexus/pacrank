@@ -70,4 +70,4 @@ Dual-licensed under either of
 
 at your option.
 
-Copyright (c) 2026 mexus
+Copyright (c) 2026 mexus (uses Arch btw)

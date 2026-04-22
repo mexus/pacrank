@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.91"
 authors = ["mexus"]
 license = "Apache-2.0 OR MIT"
+description = "Pick the fastest Archlinux mirrors (I use Arch btw)"
 
 [dependencies]
 camino = "1.2.2"
