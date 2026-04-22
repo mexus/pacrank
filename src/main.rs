@@ -5,7 +5,7 @@ use std::{
 };
 
 use camino::Utf8Path;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use display_error_chain::DisplayErrorChain;
 use futures_util::StreamExt;
 use human_repr::HumanThroughput;
@@ -38,13 +38,23 @@ struct Args {
 
     /// Limit mirrors to these countries. Pass the flag multiple times for
     /// more than one (e.g. `-c US -c DE`).
-    #[arg(long, short, value_enum, ignore_case = true, required = true)]
+    #[arg(
+        long,
+        short,
+        value_enum,
+        ignore_case = true,
+        required_unless_present = "generate_completions"
+    )]
     country: Vec<CountryCode>,
 
     /// Runs a worker that drops privileges, discovers the fastest mirrors and
     /// reports them back.
     #[arg(long, hide(true))]
     worker: bool,
+
+    /// Emit a shell completion script to stdout and exit.
+    #[arg(long, value_name = "SHELL", value_enum, hide = true, exclusive = true)]
+    generate_completions: Option<clap_complete::Shell>,
 }
 
 #[snafu::report]
@@ -55,7 +65,18 @@ fn main() -> Result<(), snafu::Whatever> {
         dry_run,
         worker,
         country,
+        generate_completions,
     } = parse_args();
+
+    if let Some(shell) = generate_completions {
+        clap_complete::generate(
+            shell,
+            &mut Args::command(),
+            "pacrank",
+            &mut std::io::stdout(),
+        );
+        return Ok(());
+    }
 
     init_tracing();
 
