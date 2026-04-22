@@ -15,9 +15,8 @@ where
     }
 }
 
-pub struct NoOpProgress;
-
 pub async fn download<U, C>(
+    client: &reqwest::Client,
     url: U,
     mut callback: C,
     time_limit: Duration,
@@ -26,7 +25,7 @@ where
     U: IntoUrl,
     C: ProgressCallback,
 {
-    let mut response = reqwest::get(url).await?.error_for_status()?;
+    let mut response = client.get(url).send().await?.error_for_status()?;
     let maybe_length = response.content_length().filter(|len| *len != 0);
     let mut downloaded = 0u64;
     let start = Instant::now();

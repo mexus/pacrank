@@ -43,11 +43,13 @@ pub enum DiscoveryError {
     },
 }
 
-pub async fn discover(repo_url: &Url) -> Result<Url, DiscoveryError> {
+pub async fn discover(client: &reqwest::Client, repo_url: &Url) -> Result<Url, DiscoveryError> {
     let core_db_url = repo_url
         .join("core/os/x86_64/core.db")
         .context(InvalidCoreUrlSnafu)?;
-    let response = reqwest::get(core_db_url.as_str())
+    let response = client
+        .get(core_db_url.as_str())
+        .send()
         .await
         .context(RequestFailedSnafu {
             url: core_db_url.clone(),

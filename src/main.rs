@@ -5,7 +5,7 @@ use std::{
 };
 
 use arch_mirrors::{
-    CountryCode, Mirror, Mirrors, Protocol,
+    APP_USER_AGENT, CountryCode, Mirror, Mirrors, Protocol,
     ping_stat::{PingStatComputed, PingStatRunning},
 };
 use camino::Utf8Path;
@@ -35,6 +35,9 @@ struct Args {
     #[arg(long, short)]
     dry_run: bool,
 
+    #[arg(long, short, default_value_t = CountryCode::RU)]
+    country: CountryCode,
+
     #[doc(hidden)]
     #[arg(long)]
     worker: bool,
@@ -47,6 +50,7 @@ fn main() -> Result<(), snafu::Whatever> {
         dl_k,
         dry_run,
         worker,
+        country,
     } = Args::parse();
 
     tracing_subscriber::registry()
@@ -59,13 +63,14 @@ fn main() -> Result<(), snafu::Whatever> {
         .init();
 
     if dry_run {
-        discover_best_mirrors(dl_k, ping_k)?;
+        drop_privileges()?;
+        discover_best_mirrors(dl_k, ping_k, country)?;
         tracing::info!("Refusing to update the mirror list (dry run enabled)");
     } else if worker {
         // Worker process.
         drop_privileges()?;
-        let result =
-            discover_best_mirrors(dl_k, ping_k).map_err(|e| DisplayErrorChain::new(e).to_string());
+        let result = discover_best_mirrors(dl_k, ping_k, country)
+            .map_err(|e| DisplayErrorChain::new(e).to_string());
         serde_json::to_writer(std::io::stdout(), &result)
             .whatever_context("Failed to serialize the result")?;
     } else {
@@ -81,11 +86,8 @@ fn main() -> Result<(), snafu::Whatever> {
         let mut output = tempfile::NamedTempFile::new_in("/etc/pacman.d/")
             .whatever_context("Can't create a temporary file")?;
 
-        let mut args = std::env::args();
-        let _cmd_name = args.next().whatever_context("Command name is missing")?;
-
         let child = Command::new(current_exe)
-            .args(args)
+            .args(std::env::args().skip(1))
             .arg("--worker")
             .stdout(Stdio::piped())
             .spawn()
@@ -152,19 +154,18 @@ fn drop_privileges() -> Result<(), snafu::Whatever> {
 fn discover_best_mirrors(
     dl_k: NonZeroUsize,
     ping_k: NonZeroUsize,
+    country: CountryCode,
 ) -> Result<Vec<Url>, snafu::Whatever> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .whatever_context("Can't initialize Tokio")?;
-    let _handle = rt.enter();
-    rt.block_on(discover_best_mirrors_impl(dl_k, ping_k))
+    rt.block_on(discover_best_mirrors_impl(dl_k, ping_k, country))
 }
 
 struct MirrorData<PING = PingStatRunning> {
     mirror: Mirror,
     last_sync_url: Url,
-    core_db_url: Url,
     ping_stat: PING,
     dl_speed: f64,
 }
@@ -175,14 +176,9 @@ impl MirrorData<PingStatRunning> {
             .url
             .join("lastsync")
             .whatever_context("Can't build the lastsync url")?;
-        let core_db_url = mirror
-            .url
-            .join("core/os/x86_64/core.db")
-            .whatever_context("Can't build the core.db url")?;
         Ok(Self {
             mirror,
             last_sync_url,
-            core_db_url,
             ping_stat: PingStatRunning::default(),
             dl_speed: f64::NEG_INFINITY,
         })
@@ -192,7 +188,6 @@ impl MirrorData<PingStatRunning> {
         MirrorData {
             mirror: self.mirror.clone(),
             last_sync_url: self.last_sync_url.clone(),
-            core_db_url: self.core_db_url.clone(),
             ping_stat: self.ping_stat.compute(rng),
             dl_speed: self.dl_speed,
         }
@@ -202,8 +197,16 @@ impl MirrorData<PingStatRunning> {
 async fn discover_best_mirrors_impl(
     dl_k: std::num::NonZero<usize>,
     ping_k: std::num::NonZero<usize>,
+    country: CountryCode,
 ) -> Result<Vec<Url>, snafu::Whatever> {
-    let Mirrors::V3(mirrors) = reqwest::get("https://archlinux.org/mirrors/status/json/")
+    let client = reqwest::Client::builder()
+        .user_agent(APP_USER_AGENT)
+        .connect_timeout(Duration::from_secs(2))
+        .build()
+        .expect("Should be OK");
+    let Mirrors::V3(mirrors) = client
+        .get("https://archlinux.org/mirrors/status/json/")
+        .send()
         .await
         .whatever_context("Can't fetch mirrors list")?
         .json()
@@ -220,7 +223,7 @@ async fn discover_best_mirrors_impl(
                 && let Some(delay) = mirror.delay
                 && last_sync >= oldest_sync
                 && delay <= max_delay.as_secs()
-                && mirror.country_code == CountryCode::RU
+                && mirror.country_code == country
                 && mirror.protocol != Protocol::Rsync
                 && let Ok(mirror_data) = MirrorData::try_new(mirror)
             {
@@ -231,13 +234,14 @@ async fn discover_best_mirrors_impl(
         })
         .collect::<Vec<_>>();
     snafu::ensure_whatever!(!ru_list.is_empty(), "No mirrors available");
-    tracing::info!("Discovered {} Russian mirrors", ru_list.len());
+    tracing::info!("Discovered {} mirrors for {country}", ru_list.len());
     let last_ping = Instant::now() + Duration::from_secs(3);
     let streams = ru_list
         .iter()
         .enumerate()
         .map(|(n, mirror_data)| {
             arch_mirrors::ping_test::ping_url(
+                &client,
                 mirror_data.last_sync_url.clone(),
                 Duration::from_secs(1),
                 last_ping,
@@ -252,11 +256,11 @@ async fn discover_best_mirrors_impl(
         match result {
             Ok(duration) => {
                 mirror_data.ping_stat.record_ping(duration);
-                tracing::debug!("{}: {duration:?}", mirror_data.mirror.url)
+                tracing::debug!("{}: {duration:?}", mirror_data.mirror.url);
             }
             Err(err) => {
                 mirror_data.ping_stat.record_error();
-                tracing::warn!("{}: {err:?}", mirror_data.mirror.url)
+                tracing::warn!("{}: {err:?}", mirror_data.mirror.url);
             }
         }
     }
@@ -269,7 +273,7 @@ async fn discover_best_mirrors_impl(
         .collect::<Vec<_>>();
     snafu::ensure_whatever!(!ru_list.is_empty(), "No servers to continue with");
     ru_list.sort_by_key(|m| m.ping_stat.median());
-    keep_top(&mut ru_list, ping_k);
+    ru_list.truncate(ping_k.get());
     if tracing::enabled!(tracing::Level::DEBUG) {
         for data in &ru_list {
             let low = data.ping_stat.low();
@@ -299,7 +303,7 @@ async fn discover_best_mirrors_impl(
     let pb = all_progress.add(dl_progress);
     for data in &mut ru_list {
         mirrors_progress.inc(1);
-        match dl_mirror(data, &pb).await {
+        match dl_mirror(&client, data, &pb).await {
             Ok(speed) => {
                 data.dl_speed = speed;
             }
@@ -315,7 +319,7 @@ async fn discover_best_mirrors_impl(
     ru_list.retain(|data| data.dl_speed.is_finite());
     snafu::ensure_whatever!(!ru_list.is_empty(), "No servers to continue with");
     ru_list.sort_by(|a, b| a.dl_speed.total_cmp(&b.dl_speed).reverse());
-    keep_top(&mut ru_list, dl_k);
+    ru_list.truncate(dl_k.get());
     for data in &ru_list {
         eprintln!(
             "{}:\n  * DL speed: {}\n  * TTFB: {:.2?}",
@@ -328,15 +332,18 @@ async fn discover_best_mirrors_impl(
 }
 
 async fn dl_mirror<T>(
+    client: &reqwest::Client,
     mirror_data: &MirrorData<T>,
     dl_progress: &ProgressBar,
 ) -> Result<f64, snafu::Whatever> {
-    let largest_file_url = arch_mirrors::largest_file_discovery::discover(&mirror_data.mirror.url)
-        .await
-        .whatever_context("Failed to discover the largest file")?;
+    let largest_file_url =
+        arch_mirrors::largest_file_discovery::discover(client, &mirror_data.mirror.url)
+            .await
+            .whatever_context("Failed to discover the largest file")?;
     dl_progress.set_prefix(mirror_data.mirror.url.to_string());
     dl_progress.reset();
     let result = arch_mirrors::dl_test::download(
+        client,
         largest_file_url.clone(),
         |downloaded, maybe_length| {
             if let Some(length) = maybe_length {
@@ -356,10 +363,4 @@ async fn dl_mirror<T>(
         speed / 1024.
     );
     Ok(speed)
-}
-
-fn keep_top<T>(vector: &mut Vec<T>, max_items: NonZeroUsize) {
-    vector.resize_with(max_items.get().min(vector.len()), || {
-        unreachable!("We never allocate new elements")
-    });
 }

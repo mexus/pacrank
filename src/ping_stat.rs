@@ -47,32 +47,6 @@ impl PingStatRunning {
         self.errors
     }
 
-    pub fn duration_avg(&self) -> Duration {
-        let cnt = self.durations.len();
-        if cnt == 0 {
-            return Duration::ZERO;
-        }
-        let avg_secs = self.durations.iter().map(|d| d.as_secs_f64()).sum::<f64>() / cnt as f64;
-        Duration::from_secs_f64(avg_secs)
-    }
-
-    pub fn duration_std_error(&self) -> Duration {
-        let cnt = self.durations.len();
-        if cnt <= 1 {
-            return Duration::ZERO;
-        }
-        let avg_secs = self.durations.iter().map(|d| d.as_secs_f64()).sum::<f64>() / cnt as f64;
-        let variance = self
-            .durations
-            .iter()
-            .map(|d| (d.as_secs_f64() - avg_secs).powi(2))
-            .sum::<f64>()
-            / (cnt as f64 - 1.);
-        let std_dev = variance.max(0.).sqrt();
-        let std_error = std_dev / (cnt as f64).sqrt();
-        Duration::from_secs_f64(std_error)
-    }
-
     pub fn compute<R>(&self, rng: &mut R) -> PingStatComputed
     where
         R: Rng + ?Sized,
@@ -110,14 +84,14 @@ impl PingStatRunning {
                 resampled.iter().map(|d| d.as_secs_f64()).sum::<f64>() / durations_count as f64;
             means.push(mean);
         }
-        means.sort_by(|x, y| x.total_cmp(y));
+        means.sort_by(f64::total_cmp);
 
         // 5 percentile
-        let p_05 = means[REPEATS / 100 * 5 - 1];
+        let p_05 = means[REPEATS * 5 / 100 - 1];
         // median
         let median = means[REPEATS / 2 - 1];
         // 95 percentile
-        let p_95 = means[REPEATS / 100 * 95 - 1];
+        let p_95 = means[REPEATS * 95 / 100 - 1];
 
         (
             Duration::from_secs_f64(p_05),

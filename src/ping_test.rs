@@ -2,14 +2,17 @@ use std::time::{Duration, Instant};
 
 use display_error_chain::DisplayErrorChain;
 use futures_util::Stream;
-use rand::{Rng, RngExt, SeedableRng};
+use rand::{Rng, RngExt};
 use reqwest::IntoUrl;
 
 /// Runs a HEAD request against the provided URL and measures the time until any
 /// response is received.
-async fn time_to_first_byte_once<T: IntoUrl>(url: T) -> reqwest::Result<Duration> {
+async fn time_to_first_byte_once<T: IntoUrl>(
+    client: &reqwest::Client,
+    url: T,
+) -> reqwest::Result<Duration> {
     let start = Instant::now();
-    let _response = reqwest::Client::builder().build()?.head(url).send().await?;
+    let _response = client.head(url).send().await?;
     Ok(start.elapsed())
 }
 
@@ -19,14 +22,16 @@ async fn time_to_first_byte_once<T: IntoUrl>(url: T) -> reqwest::Result<Duration
 ///
 /// Requires Tokio runtime!
 pub fn ping_url<T: IntoUrl + Clone>(
+    client: &reqwest::Client,
     url: T,
     interval: Duration,
     until: Instant,
 ) -> impl Stream<Item = Result<Duration, String>> {
-    let mut rng = rand::rngs::StdRng::seed_from_u64(1337);
+    let mut rng: rand::rngs::StdRng = rand::make_rng();
     futures_util::stream::unfold((true, Instant::now()), move |(is_first, last_request)| {
         let url = url.clone();
         let interval = jitter_duration(interval, 0.1, &mut rng);
+        let client = client.clone();
         async move {
             if Instant::now() >= until {
                 None
@@ -35,9 +40,15 @@ pub fn ping_url<T: IntoUrl + Clone>(
                     let next_ping = last_request + interval;
                     tokio::time::sleep_until(next_ping.into()).await;
                 }
-                let result = time_to_first_byte_once(url)
-                    .await
-                    .map_err(|e| DisplayErrorChain::new(e).to_string());
+
+                let result =
+                    tokio::time::timeout_at(until.into(), time_to_first_byte_once(&client, url))
+                        .await
+                        .map_err(|e| DisplayErrorChain::new(e).to_string())
+                        .and_then(|result| {
+                            result.map_err(|e| DisplayErrorChain::new(e).to_string())
+                        });
+
                 Some((result, (false, Instant::now())))
             }
         }
