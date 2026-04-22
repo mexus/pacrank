@@ -72,7 +72,9 @@ fn main() -> Result<(), snafu::Whatever> {
     // The split keeps network I/O unprivileged while isolating the file
     // rewrite in a minimal privileged branch.
     if dry_run {
-        drop_privileges()?;
+        if nix::unistd::Uid::effective().is_root() {
+            drop_privileges()?;
+        }
         discover_best_mirrors(dl_k, ping_k, country)?;
         tracing::info!("Refusing to update the mirror list (dry run enabled)");
     } else if worker {
@@ -343,7 +345,7 @@ async fn discover_best_mirrors_impl(
             }
             Err(err) => {
                 mirror_data.ping_stat.record_error();
-                tracing::warn!("{}: {err:?}", mirror_data.mirror.url);
+                tracing::debug!("{}: {err:?}", mirror_data.mirror.url);
             }
         }
     }
@@ -452,7 +454,6 @@ async fn dl_mirror<T>(
         Duration::from_secs(2),
     )
     .await;
-    dl_progress.finish();
     let (bytes, time) = result.whatever_context("Failed to download the largest file")?;
     let speed = bytes as f64 / time.as_secs_f64();
     tracing::debug!(

@@ -100,7 +100,7 @@ impl PingStatRunning {
         // Degenerate cases: no point resampling if there's nothing to sample
         // from, or only one sample (every resample returns the same value).
         if durations_count == 0 {
-            return (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+            return (Duration::MAX, Duration::MAX, Duration::MAX);
         } else if durations_count == 1 {
             let the_only = self.durations[0];
             return (the_only, the_only, the_only);

@@ -43,27 +43,26 @@ pub fn ping_url<T: IntoUrl + Clone>(
         // async state machine.
         let client = client.clone();
         async move {
-            if Instant::now() >= until {
-                None
-            } else {
-                if !is_first {
-                    let next_ping = last_request + interval;
-                    tokio::time::sleep_until(next_ping.into()).await;
+            if !is_first {
+                let next_ping = last_request + interval;
+                if next_ping >= until {
+                    return None;
                 }
-
-                // `timeout_at(until, ...)` caps the request at the phase
-                // deadline: a hung connection gets cancelled instead of
-                // bleeding into the next phase.
-                let result =
-                    tokio::time::timeout_at(until.into(), time_to_first_byte_once(&client, url))
-                        .await
-                        .map_err(|e| DisplayErrorChain::new(e).to_string())
-                        .and_then(|result| {
-                            result.map_err(|e| DisplayErrorChain::new(e).to_string())
-                        });
-
-                Some((result, (false, Instant::now())))
+                tokio::time::sleep_until(next_ping.into()).await;
             }
+
+            // `timeout_at(until, ...)` caps the request at the phase
+            // deadline: a hung connection gets cancelled instead of
+            // bleeding into the next phase.
+            let result = tokio::time::timeout_at(
+                tokio::time::Instant::from(until) + Duration::from_millis(500),
+                time_to_first_byte_once(&client, url),
+            )
+            .await
+            .map_err(|e| DisplayErrorChain::new(e).to_string())
+            .and_then(|result| result.map_err(|e| DisplayErrorChain::new(e).to_string()));
+
+            Some((result, (false, Instant::now())))
         }
     })
 }
