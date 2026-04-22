@@ -33,12 +33,33 @@ Reach for reflector when you want configurability and a rich set of output
 options. Reach for pacrank when you want one command that gives you an
 honest measurement and rewrites the file safely.
 
-## Quick start
+## Installation
 
-Needs Rust 1.91+ (edition 2024) and `sudo`.
+Pick whichever you have tooling for — each lands a `pacrank` binary in
+`~/.cargo/bin`. `sudo` is required at run time to rewrite
+`/etc/pacman.d/mirrorlist`, regardless of install method.
+
+**Pre-built binary via [`cargo binstall`](https://github.com/cargo-bins/cargo-binstall)** — no Rust toolchain needed:
+
+```
+cargo binstall pacrank
+```
+
+**From the git repository** — requires Rust 1.91+:
+
+```
+cargo install --git https://github.com/mexus/pacrank
+```
+
+**From a local checkout** — requires Rust 1.91+:
 
 ```
 cargo install --path .
+```
+
+## Quick start
+
+```
 pacrank --country BR
 ```
 
