@@ -8,6 +8,31 @@ each candidate a few times, downloads the largest package from `core` on
 the survivors to measure real throughput, and atomically replaces the
 mirrorlist with the winners.
 
+## How pacrank compares to reflector
+
+pacrank is not a clone or rewrite of
+[`reflector`](https://wiki.archlinux.org/title/Reflector). reflector is the
+broader tool — configurable scoring formulas, threaded bandwidth probing,
+many output modes. pacrank takes a narrower shape on purpose:
+
+- **One opinionated pipeline, few knobs.** Filter mirrors by country and
+  freshness, keep the lowest-latency survivors, then measure real throughput
+  by downloading the largest `core` package for a bounded time. Rank by
+  observed bytes per second. Two tunables: `--ping-k` and `--dl-k`.
+- **Throughput measured serially, one mirror at a time.** Concurrent probes
+  split your local bandwidth across workers and distort each mirror's
+  number; a sequential probe tells you what a real `pacman -Sy` will see on
+  your link.
+- **Privilege handling is the tool's job, not yours.** pacrank escalates
+  through `sudo`, drops to `nobody` before opening a single socket, and
+  replaces the mirrorlist with an atomic `rename(2)` that preserves the
+  original file mode. You don't compose this yourself with `sudo` and shell
+  redirection.
+
+Reach for reflector when you want configurability and a rich set of output
+options. Reach for pacrank when you want one command that gives you an
+honest measurement and rewrites the file safely.
+
 ## Quick start
 
 Needs Rust 1.91+ (edition 2024) and `sudo`.
