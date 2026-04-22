@@ -121,7 +121,7 @@ fn main() -> Result<(), snafu::Whatever> {
                 .as_file()
                 .sync_all()
                 .whatever_context("Can't sync temporary file")?;
-            tracing::info!("Temporary file populated");
+            tracing::debug!("Temporary file populated");
             output
                 .as_file()
                 .set_permissions(perm)

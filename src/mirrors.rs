@@ -159,7 +159,7 @@ macro_rules! countries {
             }
 
             /// Returns a human-readable country name.
-            pub fn as_str(&self) -> &'static str {
+            pub fn full_name(&self) -> &'static str {
                 match self {
                     $( Self::$code => $full_name, )*
                     Self::Unknown => "[unknown]",
@@ -188,7 +188,7 @@ macro_rules! countries {
 
         impl std::fmt::Display for $container {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                std::fmt::Display::fmt(self.as_str(), f)
+                std::fmt::Display::fmt(self.as_code(), f)
             }
         }
     };
@@ -296,6 +296,10 @@ pub(crate) mod test {
             let code_str = code.as_code();
             let code_parsed = code_str.parse().expect("Must be ok");
             assert_eq!(code, code_parsed, "code_str = {code_str}");
+
+            let code_fmt = code.to_string();
+            let code_parsed = code_fmt.parse().expect("Must be ok");
+            assert_eq!(code, code_parsed, "code_fmt = {code_fmt}");
         }
     }
 }
