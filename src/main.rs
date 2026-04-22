@@ -4,10 +4,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pacrank::{
-    APP_USER_AGENT, CountryCode, Mirror, Mirrors, Protocol,
-    ping_stat::{PingStatComputed, PingStatRunning},
-};
 use camino::Utf8Path;
 use clap::Parser;
 use display_error_chain::DisplayErrorChain;
@@ -15,6 +11,10 @@ use futures_util::StreamExt;
 use human_repr::HumanThroughput;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nonzero_ext::nonzero;
+use pacrank::{
+    APP_USER_AGENT, CountryCode, Mirror, Mirrors, Protocol,
+    ping_stat::{PingStatComputed, PingStatRunning},
+};
 use rand::{Rng, SeedableRng};
 use snafu::{OptionExt, ResultExt};
 use time::OffsetDateTime;
