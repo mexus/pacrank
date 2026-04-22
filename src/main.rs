@@ -36,7 +36,7 @@ struct Args {
     dry_run: bool,
 
     /// Limit mirrors to this country.
-    #[arg(long, short, default_value_t = CountryCode::RU)]
+    #[arg(long, short)]
     country: CountryCode,
 
     /// Runs a worker that drops privileges, discovers the fastest mirrors and
