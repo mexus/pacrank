@@ -1,3 +1,7 @@
+# Rendered template (PKGBUILD.in is the source of truth).
+PKGBUILD
+.SRCINFO
+
 # makepkg build dirs and artifacts
 src/
 pkg/
