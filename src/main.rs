@@ -1,5 +1,6 @@
 use std::{
     num::NonZeroUsize,
+    os::unix::fs::{MetadataExt, fchown},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -247,6 +248,8 @@ fn write_mirrorlist(mirrors: &[Url]) -> Result<(), snafu::Whatever> {
     // Capture the existing file's permissions so the replacement lands with
     // the same mode — we never want to broaden access on `/etc`.
     let perm = meta.permissions();
+    let uid = meta.uid();
+    let gid = meta.gid();
     // Write into a NamedTempFile in the same directory as the target so the
     // final `persist()` is an atomic rename on the same filesystem.
     let mut output = tempfile::NamedTempFile::new_in("/etc/pacman.d/")
@@ -269,6 +272,8 @@ fn write_mirrorlist(mirrors: &[Url]) -> Result<(), snafu::Whatever> {
         .as_file()
         .set_permissions(perm)
         .whatever_context("Unable to update permissions of the temporary file")?;
+    fchown(output.as_file(), Some(uid), Some(gid))
+        .whatever_context("Unable to update ownership of the temporary file")?;
     output
         .persist("/etc/pacman.d/mirrorlist")
         .whatever_context("Unable to persist the mirror list")?;
