@@ -9,6 +9,9 @@
 
 /// Parser for pacman's per-package `desc` metadata.
 pub mod arch_desc;
+/// Auto-detect the user's nearest country (or top-K nearest countries) by
+/// sample-pinging the global mirror list.
+pub mod country_detect;
 /// Timed HTTP download used to estimate mirror throughput.
 pub mod dl_test;
 /// Finds the largest package in a mirror's `core` repository.

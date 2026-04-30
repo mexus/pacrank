@@ -1,12 +1,13 @@
 # pacrank
 
-Pick the fastest Archlinux mirrors for one or more countries and write them
-to `/etc/pacman.d/mirrorlist`.
+Pick the fastest Archlinux mirrors for your location and write them to
+`/etc/pacman.d/mirrorlist`.
 
-Fetches the official mirrors list, filters by country and freshness, pings
-each candidate a few times, downloads the largest package from `core` on
-the survivors to measure real throughput, and atomically replaces the
-mirrorlist with the winners.
+Auto-detects your closest countries by sample-pinging the global mirror list
+(or pass `--country` explicitly), filters the official mirrors list by
+country and freshness, pings each candidate a few times, downloads the
+largest package from `core` on the survivors to measure real throughput,
+and atomically replaces the mirrorlist with the winners.
 
 ## How pacrank compares to reflector
 
@@ -81,35 +82,53 @@ cargo install --path .
 ## Quick start
 
 ```
-pacrank --country BR
+pacrank
 ```
 
-sudo prompts for your password (see [Privileges](#privileges) below),
-the latency and download phases run, and `/etc/pacman.d/mirrorlist`
-is rewritten with the top picks.
+With no flags, pacrank auto-detects your closest countries by
+sample-pinging the global mirror list, then sudo prompts for your password
+(see [Privileges](#privileges) below), the latency and download phases
+run, and `/etc/pacman.d/mirrorlist` is rewritten with the top picks. The
+detected countries are cached under `$XDG_CACHE_HOME/pacrank/countries.json`
+(or `~/.cache/pacrank/countries.json`) and reused as long as your public IP
+prefix is unchanged and the entry is fresh.
 
-Pass `--country` multiple times to pool candidates across countries — useful
-near a border or when one country has few mirrors. `--ping-k` and `--dl-k`
-remain **global** caps applied to the combined pool, not per-country:
+If you'd rather pick countries yourself, pass `--country` (repeat the flag
+to pool candidates across countries — useful near a border or when one
+country has few mirrors). `--ping-k` and `--dl-k` remain **global** caps
+applied to the combined pool, not per-country:
 
 ```
 pacrank --country DE --country NL --country FR
 ```
 
-Dry run — no sudo, nothing written:
+Dry run — no sudo, nothing written, and the country cache is left alone:
 
 ```
-pacrank --country BR --dry-run
+pacrank --dry-run
 ```
 
 ## Options
 
 - `--country <CC>` / `-c <CC>` — ISO country code filter (`RU` for Russia,
   `CN` for China, `DE` for Germany, `US` for the USA and so on). Repeat the
-  flag to pool mirrors from several countries, e.g. `-c US -c CA`.
+  flag to pool mirrors from several countries, e.g. `-c US -c CA`. **When
+  omitted, the closest countries are auto-detected.**
 - `--ping-k N` — keep the N lowest-latency mirrors after the ping phase (default 10)
 - `--dl-k N` — keep the N fastest-download mirrors for the final list (default 5)
 - `--dry-run` — run both phases, print results, don't touch the mirrorlist
+  or the country cache
+
+Country auto-detection (only used when `--country` is not passed):
+
+- `--detect-baseline-n N` — number of fastest-pinged mirrors whose median
+  latency forms the per-mirror baseline (default 5)
+- `--detect-threshold F` — drop mirrors slower than `F * baseline` before
+  picking countries (default 1.5)
+- `--detect-k-countries N` — maximum number of distinct countries returned
+  (default 3)
+- `--no-country-cache` — bypass the country cache for this invocation
+  (always re-detect, never persist)
 
 Log level follows `RUST_LOG` (e.g. `RUST_LOG=debug`); the variable survives
 the sudo step.

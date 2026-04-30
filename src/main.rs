@@ -14,6 +14,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nonzero_ext::nonzero;
 use pacrank::{
     APP_USER_AGENT, CountryCode, Mirror, Mirrors, Protocol,
+    country_detect::{self, DetectOptions},
     ping_stat::{PingStatComputed, PingStatRunning},
 };
 use rand::{Rng, SeedableRng};
@@ -38,15 +39,25 @@ struct Args {
     dry_run: bool,
 
     /// Limit mirrors to these countries. Pass the flag multiple times for
-    /// more than one (e.g. `-c US -c DE`).
-    #[arg(
-        long,
-        short,
-        value_enum,
-        ignore_case = true,
-        required_unless_present = "generate_completions"
-    )]
+    /// more than one (e.g. `-c US -c DE`). When omitted, the closest
+    /// countries are auto-detected by sample-pinging the global mirror list.
+    #[arg(long, short, value_enum, ignore_case = true)]
     country: Vec<CountryCode>,
+
+    /// Number of fastest-pinged mirrors whose median latency forms the
+    /// per-mirror baseline used for country auto-detection.
+    #[arg(long, default_value_t = nonzero!(5usize))]
+    detect_baseline_n: NonZeroUsize,
+    /// Mirrors whose latency exceeds `threshold * baseline` are dropped
+    /// before country auto-detection picks winners.
+    #[arg(long, default_value_t = 1.5)]
+    detect_threshold: f64,
+    /// Maximum number of distinct countries returned by auto-detection.
+    #[arg(long, default_value_t = nonzero!(3usize))]
+    detect_k_countries: NonZeroUsize,
+    /// Bypass the country cache for this invocation (always re-detect).
+    #[arg(long)]
+    no_country_cache: bool,
 
     /// Runs a worker that drops privileges, discovers the fastest mirrors and
     /// reports them back.
@@ -65,9 +76,13 @@ fn main() -> Result<(), snafu::Whatever> {
         dl_k,
         dry_run,
         worker,
-        country,
+        mut country,
+        detect_baseline_n,
+        detect_threshold,
+        detect_k_countries,
+        no_country_cache,
         generate_completions,
-    } = parse_args();
+    } = Args::parse();
 
     if let Some(shell) = generate_completions {
         clap_complete::generate(
@@ -81,6 +96,27 @@ fn main() -> Result<(), snafu::Whatever> {
 
     init_tracing();
 
+    // Country auto-detection runs in the user-context parent only — never
+    // in the worker, which receives the resolved list via argv. Doing it
+    // here guarantees the cache lands under the invoking user's HOME, not
+    // root's, and that we don't survey twice (parent + worker).
+    if country.is_empty() && !worker {
+        country = country_detect::resolve(DetectOptions {
+            baseline_n: detect_baseline_n,
+            threshold: detect_threshold,
+            k_countries: detect_k_countries,
+            read_cache: !no_country_cache,
+            // --dry-run must leave no side effects, so skip persisting the
+            // detection result even when caching is otherwise enabled.
+            write_cache: !no_country_cache && !dry_run,
+        })
+        .whatever_context("Country auto-detection failed")?;
+    }
+    snafu::ensure_whatever!(
+        !country.is_empty(),
+        "No countries available — pass --country/-c explicitly."
+    );
+
     // Three modes of operation:
     //   - dry-run:   drop to `nobody`, run the discovery, print results.
     //   - --worker:  same as dry-run but emits JSON to stdout for the parent.
@@ -93,7 +129,7 @@ fn main() -> Result<(), snafu::Whatever> {
     } else if worker {
         run_worker(dl_k, ping_k, &country)
     } else {
-        run_privileged()
+        run_privileged(&country)
     }
 }
 
@@ -108,26 +144,19 @@ fn init_tracing() {
         .init();
 }
 
-/// Parses CLI args, replacing clap's generic "required argument missing"
-/// error with a list of accepted country codes.
+/// Builds the argv to forward to a child process (sudo re-exec or
+/// `--worker` subprocess) — our own arguments minus `argv[0]`, with each
+/// resolved country appended as `-c <CODE>`.
 ///
-/// `--country` is currently the only required argument, so any
-/// `MissingRequiredArgument` here is about it; revisit if that ever changes.
-fn parse_args() -> Args {
-    match Args::try_parse() {
-        Ok(args) => args,
-        Err(e) if e.kind() == clap::error::ErrorKind::MissingRequiredArgument => {
-            eprintln!(
-                "error: at least one --country <COUNTRY> is required \
-                 (repeat the flag for more than one). Accepted values:"
-            );
-            for cc in CountryCode::all() {
-                eprintln!("  {}: {}", cc.as_code(), cc.full_name());
-            }
-            std::process::exit(2);
-        }
-        Err(e) => e.exit(),
+/// Re-injecting the resolved countries here means the child sees a fully
+/// specified `--country` list and never re-runs auto-detection itself.
+fn forwarded_args(countries: &[CountryCode]) -> Vec<String> {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    for cc in countries {
+        args.push("-c".to_string());
+        args.push(cc.as_code().to_string());
     }
+    args
 }
 
 // ---------- Run modes ----------
@@ -156,6 +185,14 @@ fn run_worker(
     ping_k: NonZeroUsize,
     countries: &[CountryCode],
 ) -> Result<(), snafu::Whatever> {
+    // The parent is responsible for resolving `--country` (either from the
+    // user or via auto-detection) before spawning us. If we somehow land
+    // here with no countries it would silently produce an empty mirror
+    // list — fail loudly instead.
+    snafu::ensure_whatever!(
+        !countries.is_empty(),
+        "Worker invoked without --country; the privileged parent must resolve countries first."
+    );
     drop_privileges()?;
     let result = discover_best_mirrors(dl_k, ping_k, countries)
         .map_err(|e| DisplayErrorChain::new(e).to_string());
@@ -166,9 +203,9 @@ fn run_worker(
 
 /// Privileged parent entry point: make sure we're root, spawn an unprivileged
 /// worker, and atomically replace `/etc/pacman.d/mirrorlist` with the result.
-fn run_privileged() -> Result<(), snafu::Whatever> {
-    escalate_if_needed()?;
-    let mirrors = spawn_worker_and_read_mirrors()?;
+fn run_privileged(countries: &[CountryCode]) -> Result<(), snafu::Whatever> {
+    escalate_if_needed(countries)?;
+    let mirrors = spawn_worker_and_read_mirrors(countries)?;
     write_mirrorlist(&mirrors)?;
     Ok(())
 }
@@ -180,7 +217,7 @@ fn run_privileged() -> Result<(), snafu::Whatever> {
 /// If escalation happens, this function does not return — it exits the
 /// current process with the sudo child's exit code. On the already-root path
 /// it simply returns `Ok(())`.
-fn escalate_if_needed() -> Result<(), snafu::Whatever> {
+fn escalate_if_needed(countries: &[CountryCode]) -> Result<(), snafu::Whatever> {
     if nix::unistd::Uid::effective().is_root() {
         return Ok(());
     }
@@ -203,7 +240,7 @@ fn escalate_if_needed() -> Result<(), snafu::Whatever> {
         // privilege jump; sudo's default env_reset would otherwise drop it.
         .arg("--preserve-env=RUST_LOG,PACRANK_ESCALATED")
         .arg(current_exe)
-        .args(std::env::args().skip(1))
+        .args(forwarded_args(countries))
         .status()
         .whatever_context("Failed to execute sudo; install sudo or re-run as root")?;
     std::process::exit(status.code().unwrap_or(1));
@@ -211,11 +248,11 @@ fn escalate_if_needed() -> Result<(), snafu::Whatever> {
 
 /// Spawns this binary with `--worker`, collects its stdout, and decodes the
 /// JSON-encoded list of winning mirror URLs.
-fn spawn_worker_and_read_mirrors() -> Result<Vec<Url>, snafu::Whatever> {
+fn spawn_worker_and_read_mirrors(countries: &[CountryCode]) -> Result<Vec<Url>, snafu::Whatever> {
     let current_exe =
         std::env::current_exe().whatever_context("Can't get current executable path")?;
     let child = Command::new(current_exe)
-        .args(std::env::args().skip(1))
+        .args(forwarded_args(countries))
         .arg("--worker")
         .stdout(Stdio::piped())
         .spawn()
