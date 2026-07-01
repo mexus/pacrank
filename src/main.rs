@@ -448,6 +448,7 @@ fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(2))
+        .tls_certs_only(pacrank::tls_roots())
         .build()
         .expect("Should be OK")
 }

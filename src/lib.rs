@@ -30,3 +30,21 @@ pub use mirrors::{CountryCode, Mirror, Mirrors, MirrorsV3, Protocol};
 /// Identifying the tool is polite to mirror operators and helps with debugging
 /// on their side. The value is derived at compile time from `Cargo.toml`.
 pub static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+
+/// The bundled Mozilla root certificates, ready to hand to
+/// [`reqwest::ClientBuilder::tls_certs_only`].
+///
+/// reqwest 0.13 verifies server certificates with `rustls-platform-verifier`
+/// by default. On Android that verifier has to be initialized through the JVM,
+/// which never happens under Termux (a bare Linux userland) — so the very
+/// first HTTPS handshake panics with *"Expect rustls-platform-verifier to be
+/// initialized"* (see issue #1). Pinning the client to this bundled root store
+/// routes verification through webpki instead, sidestepping the platform
+/// verifier entirely and making the binary self-contained on every target we
+/// ship.
+pub fn tls_roots() -> Vec<reqwest::Certificate> {
+    webpki_root_certs::TLS_SERVER_ROOT_CERTS
+        .iter()
+        .map(|der| reqwest::Certificate::from_der(der).expect("bundled webpki roots are valid DER"))
+        .collect()
+}

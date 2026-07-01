@@ -1,6 +1,6 @@
 [package]
 name = "pacrank"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.91"
 authors = ["mexus"]
@@ -40,6 +40,7 @@ tokio = { version = "1.52.1", features = ["full"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["ansi", "env-filter", "fmt"] }
 url = { version = "2.5.8", features = ["serde"] }
+webpki-root-certs = "1.0.7"
 zstd = "0.13.3"
 
 # # TUI
