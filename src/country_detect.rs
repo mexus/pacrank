@@ -147,6 +147,7 @@ async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectEr
     let client = reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(2))
+        .tls_certs_only(crate::tls_roots())
         .build()
         .context(BuildClientSnafu)?;
 
