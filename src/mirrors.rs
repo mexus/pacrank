@@ -65,11 +65,45 @@ impl serde::Serialize for Mirrors {
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 pub struct MirrorsV3 {
     /// The actual list of mirrors.
+    ///
+    /// Deserialized leniently: see [`lenient_mirrors`].
+    #[serde(deserialize_with = "lenient_mirrors")]
     pub urls: Vec<Mirror>,
 
     /// Last check time.
     #[serde(with = "time::serde::iso8601")]
     pub last_check: time::OffsetDateTime,
+}
+
+/// Deserializes the mirror list, dropping entries that fail to parse instead
+/// of failing the list as a whole.
+///
+/// A single bad entry — an URL the `url` crate rejects, a timestamp in an
+/// unexpected shape — would otherwise cost us all thousand-odd mirrors. Since
+/// every entry is independent, skipping the offender (loudly) is always the
+/// better trade.
+fn lenient_mirrors<'de, D>(deserializer: D) -> Result<Vec<Mirror>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Vec<serde_json::Value> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(raw
+        .into_iter()
+        .filter_map(|entry| {
+            let url = entry
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<no url>")
+                .to_owned();
+            match serde_json::from_value(entry) {
+                Ok(mirror) => Some(mirror),
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable mirror entry {url}: {e}");
+                    None
+                }
+            }
+        })
+        .collect())
 }
 
 /// Archlinux mirror info.
@@ -85,7 +119,11 @@ pub struct Mirror {
     pub country_code: CountryCode,
 
     /// Delay (seconds).
-    pub delay: Option<u64>,
+    ///
+    /// Can be negative when the mirror's reported sync timestamp is ahead of
+    /// the check time (clock skew on the mirror's side), so it must not be
+    /// deserialized as an unsigned integer.
+    pub delay: Option<i64>,
 
     /// Last sync time.
     #[serde(with = "serde_maybe_time")]
@@ -304,6 +342,10 @@ countries!(CountryCode:
 );
 
 /// Known protocols.
+///
+/// Upstream derives this from the mirror URL's scheme and stores it in a
+/// lookup table an admin can extend, so the set isn't closed; unrecognized
+/// values deserialize to [`Protocol::Unknown`] rather than failing.
 #[derive(Debug, serde::Deserialize, serde::Serialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
@@ -313,11 +355,182 @@ pub enum Protocol {
     Https,
     /// Rsync protocol.
     Rsync,
+
+    /// A protocol this version doesn't know about.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Mirror {
+    /// Whether pacman can fetch from this mirror over plain HTTP(S).
+    ///
+    /// Rsync mirrors are usable through separate tooling, but not via the
+    /// `Server = ...` lines this tool writes; neither are protocols we don't
+    /// recognize. Both must be filtered out.
+    pub fn is_http(&self) -> bool {
+        matches!(self.protocol, Protocol::Http | Protocol::Https)
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
+
+    /// A trimmed-down excerpt of the real `mirrors/status/json/` payload,
+    /// salted with the entry shapes that used to abort parsing of the *whole*
+    /// list: a negative `delay` (entry 2, taken verbatim from a live mirror),
+    /// an unknown `protocol` (entry 3) and an URL without a scheme (entry 4).
+    const MIRRORS_EXCERPT: &str = r#"{
+        "cutoff": 86400,
+        "last_check": "2026-09-03T09:05:12.086Z",
+        "num_checks": 25,
+        "check_frequency": 3600,
+        "urls": [
+            {
+                "url": "https://mirror.aarnet.edu.au/pub/archlinux/",
+                "protocol": "https",
+                "last_sync": "2026-09-03T08:22:00Z",
+                "completion_pct": 1.0,
+                "delay": 1749,
+                "duration_avg": 0.9830624709526697,
+                "duration_stddev": 0.213086265106851,
+                "score": 1.681982069392854,
+                "active": true,
+                "country": "Australia",
+                "country_code": "AU",
+                "isos": true,
+                "ipv4": true,
+                "ipv6": true,
+                "details": "https://archlinux.org/mirrors/aarnet.edu.au/5/"
+            },
+            {
+                "url": "http://repository.su/archlinux/",
+                "protocol": "http",
+                "last_sync": "2026-09-03T08:30:03Z",
+                "completion_pct": 1.0,
+                "delay": -33,
+                "duration_avg": 0.1788191944360733,
+                "duration_stddev": 0.20379207106597516,
+                "score": 0.37344459883538306,
+                "active": true,
+                "country": "Russia",
+                "country_code": "RU",
+                "isos": true,
+                "ipv4": true,
+                "ipv6": false,
+                "details": "https://archlinux.org/mirrors/repository.su/1507/"
+            },
+            {
+                "url": "ftp://mirror.example.net/archlinux/",
+                "protocol": "ftp",
+                "last_sync": "2026-09-03T07:58:11Z",
+                "completion_pct": 1.0,
+                "delay": 900,
+                "duration_avg": 0.5,
+                "duration_stddev": 0.1,
+                "score": 1.5,
+                "active": true,
+                "country": "Germany",
+                "country_code": "DE",
+                "isos": true,
+                "ipv4": true,
+                "ipv6": true,
+                "details": "https://archlinux.org/mirrors/example.net/2/"
+            },
+            {
+                "url": "mirror.example.com/archlinux/",
+                "protocol": "https",
+                "last_sync": "2026-09-03T08:11:47Z",
+                "completion_pct": 1.0,
+                "delay": 500,
+                "duration_avg": 0.3,
+                "duration_stddev": 0.1,
+                "score": 0.9,
+                "active": true,
+                "country": "France",
+                "country_code": "FR",
+                "isos": true,
+                "ipv4": true,
+                "ipv6": true,
+                "details": "https://archlinux.org/mirrors/example.com/3/"
+            },
+            {
+                "url": "rsync://mirror.example.org/archlinux/",
+                "protocol": "rsync",
+                "last_sync": null,
+                "completion_pct": 0.0,
+                "delay": null,
+                "duration_avg": null,
+                "duration_stddev": null,
+                "score": null,
+                "active": false,
+                "country": "",
+                "country_code": "",
+                "isos": false,
+                "ipv4": true,
+                "ipv6": false,
+                "details": "https://archlinux.org/mirrors/example.org/1/"
+            }
+        ],
+        "version": 3
+    }"#;
+
+    /// Mirrors whose clock runs ahead of the check server report a negative
+    /// delay; that must not break parsing of the list.
+    #[test]
+    fn parse_negative_delay() {
+        let Mirrors::V3(mirrors) =
+            serde_json::from_str(MIRRORS_EXCERPT).expect("Must parse the mirrors excerpt");
+
+        let by_delay: Vec<_> = mirrors.urls.iter().map(|m| m.delay).collect();
+        assert_eq!(by_delay, [Some(1749), Some(-33), Some(900), None]);
+
+        let negative = &mirrors.urls[1];
+        assert_eq!(negative.country_code, CountryCode::RU);
+        assert_eq!(negative.protocol, Protocol::Http);
+        assert!(negative.is_http());
+    }
+
+    /// The `protocol` field is an open-ended lookup upstream (it's derived
+    /// from the URL scheme), so an unfamiliar value must not fail the list —
+    /// and must not slip past the HTTP(S) filter either.
+    #[test]
+    fn parse_unknown_protocol() {
+        let Mirrors::V3(mirrors) =
+            serde_json::from_str(MIRRORS_EXCERPT).expect("Must parse the mirrors excerpt");
+
+        let ftp = &mirrors.urls[2];
+        assert_eq!(ftp.protocol, Protocol::Unknown);
+        assert_eq!(ftp.country_code, CountryCode::DE);
+        assert!(
+            !ftp.is_http(),
+            "An unknown protocol must never reach the mirrorlist"
+        );
+
+        // Rsync is known, and equally unusable over HTTP.
+        let rsync = &mirrors.urls[3];
+        assert_eq!(rsync.protocol, Protocol::Rsync);
+        assert!(!rsync.is_http());
+        assert_eq!(rsync.country_code, CountryCode::Unknown);
+        assert!(rsync.last_sync.is_none());
+    }
+
+    /// An entry the `url` crate rejects costs us that one mirror, not all of
+    /// them.
+    #[test]
+    fn skip_unparseable_entries() {
+        let Mirrors::V3(mirrors) =
+            serde_json::from_str(MIRRORS_EXCERPT).expect("Must parse the mirrors excerpt");
+
+        assert_eq!(mirrors.urls.len(), 4, "The scheme-less URL must be dropped");
+        assert!(
+            !mirrors
+                .urls
+                .iter()
+                .any(|m| m.url.as_str().contains("example.com")),
+            "The scheme-less URL must not be parsed into something else"
+        );
+    }
 
     #[test]
     fn country_parse() {

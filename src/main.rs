@@ -13,7 +13,7 @@ use human_repr::HumanThroughput;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use nonzero_ext::nonzero;
 use pacrank::{
-    APP_USER_AGENT, CountryCode, Mirror, Mirrors, Protocol,
+    APP_USER_AGENT, CountryCode, Mirror, Mirrors,
     country_detect::{self, DetectOptions},
     ping_stat::{PingStatComputed, PingStatRunning},
 };
@@ -481,12 +481,9 @@ async fn fetch_and_filter_mirrors(
             if let Some(last_sync) = mirror.last_sync
                 && let Some(delay) = mirror.delay
                 && last_sync >= oldest_sync
-                && delay <= max_delay.as_secs()
+                && delay <= max_delay.as_secs() as i64
                 && countries.contains(&mirror.country_code)
-                // Rsync is pacman-compatible via separate tooling, but not
-                // over plain HTTP — skip, since this binary writes
-                // HTTP(S) `Server = ...` lines.
-                && mirror.protocol != Protocol::Rsync
+                && mirror.is_http()
                 && let Ok(mirror_data) = MirrorData::try_new(mirror)
             {
                 Some(mirror_data)

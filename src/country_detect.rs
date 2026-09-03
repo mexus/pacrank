@@ -22,7 +22,7 @@ use snafu::{ResultExt, Snafu};
 use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 
-use crate::{APP_USER_AGENT, CountryCode, Mirrors, Protocol};
+use crate::{APP_USER_AGENT, CountryCode, Mirrors};
 
 /// Maximum number of mirrors probed concurrently during the survey.
 ///
@@ -100,7 +100,7 @@ impl Default for DetectOptions {
 ///
 /// Cache misses and partial network failures are handled internally and do
 /// not surface as errors — they fall back to either re-detection or a stale
-/// cache as appropriate.
+/// cache as appropriate, unless [`DetectError::is_fatal`] says otherwise.
 #[derive(Debug, Snafu)]
 pub enum DetectError {
     /// Building the HTTP client failed.
@@ -120,6 +120,34 @@ pub enum DetectError {
     /// After applying the latency threshold, no mirror survived; on a real
     /// machine this means every mirror is unreachable.
     NoCountriesSelected,
+}
+
+impl DetectError {
+    /// Whether this failure also dooms the run that follows detection.
+    ///
+    /// The list surveyed here is the very same document the download phase
+    /// filters, so once it can't be fetched or parsed there is nothing a
+    /// cached country list can rescue: the run would get as far as the sudo
+    /// password prompt and then fail identically. Better to surface the real
+    /// cause immediately, while the user still has context for it.
+    ///
+    /// Failures specific to detection itself are not fatal — an unreachable
+    /// survey says nothing about whether the download phase will work, so a
+    /// stale cache remains a reasonable guess there.
+    fn is_fatal(&self) -> bool {
+        // Matched exhaustively on purpose: a new variant should not silently
+        // inherit either answer.
+        match self {
+            Self::FetchMirrors { .. }
+            | Self::ParseMirrors { .. }
+            // Neither of these can reach the fallback (both are raised before
+            // it), but the pipeline reconstructs the same client and runtime,
+            // so a cache could not save them either.
+            | Self::BuildClient { .. }
+            | Self::BuildRuntime { .. } => true,
+            Self::NoIpAndNoCache | Self::NoSamplesAndNoCache | Self::NoCountriesSelected => false,
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -202,18 +230,17 @@ async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectEr
             }
             Ok(countries)
         }
-        Err(detect_err) => {
-            if let Some(entry) = cached {
+        Err(detect_err) => match cached {
+            Some(entry) if !detect_err.is_fatal() => {
                 tracing::warn!(
                     "Country detection failed ({}); falling back to stale cache: {}",
                     DisplayErrorChain::new(&detect_err),
                     format_countries(&entry.countries),
                 );
                 Ok(entry.countries)
-            } else {
-                Err(detect_err)
             }
-        }
+            _ => Err(detect_err),
+        },
     }
 }
 
@@ -268,10 +295,10 @@ async fn survey(client: &reqwest::Client) -> Result<Vec<Sample>, DetectError> {
         .urls
         .into_iter()
         .filter(|m| {
-            m.protocol != Protocol::Rsync
+            m.is_http()
                 && m.country_code != CountryCode::Unknown
                 && m.last_sync.is_some_and(|ts| ts >= oldest_sync)
-                && m.delay.is_some_and(|d| d <= max_delay.as_secs())
+                && m.delay.is_some_and(|d| d <= max_delay.as_secs() as i64)
         })
         .filter_map(|m| {
             let url = m.url.join("lastsync").ok()?;
@@ -553,6 +580,44 @@ mod test {
             k_countries: NonZeroUsize::new(k).unwrap(),
             read_cache: false,
             write_cache: false,
+        }
+    }
+
+    /// Builds a genuine [`reqwest::Error`] without touching the network: the
+    /// URL fails to parse, and the failure is reported on `send`.
+    async fn any_reqwest_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("not a url")
+            .send()
+            .await
+            .expect_err("An unparseable URL must fail")
+    }
+
+    /// A mirrors list we can't fetch or parse dooms the download phase too,
+    /// so detection must not paper over it with a stale cache — otherwise the
+    /// user types their sudo password only to hit the same error afterwards.
+    #[tokio::test]
+    async fn mirror_list_failures_are_fatal() {
+        let fetch = DetectError::FetchMirrors {
+            source: any_reqwest_error().await,
+        };
+        let parse = DetectError::ParseMirrors {
+            source: any_reqwest_error().await,
+        };
+        assert!(fetch.is_fatal(), "{fetch:?}");
+        assert!(parse.is_fatal(), "{parse:?}");
+    }
+
+    /// Detection-specific failures say nothing about the download phase, so
+    /// these keep the stale-cache fallback.
+    #[test]
+    fn detection_failures_keep_the_cache_fallback() {
+        for error in [
+            DetectError::NoIpAndNoCache,
+            DetectError::NoSamplesAndNoCache,
+            DetectError::NoCountriesSelected,
+        ] {
+            assert!(!error.is_fatal(), "{error:?}");
         }
     }
 
