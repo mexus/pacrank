@@ -453,6 +453,10 @@ fn build_client() -> reqwest::Client {
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(2))
         .tls_certs_only(pacrank::tls_roots())
+        // Not for the cache — this phase sees few enough mirrors that it
+        // hardly matters — but so that an unresponsive name is a cancellable
+        // future rather than a blocking thread that outlives the runtime.
+        .dns_resolver(pacrank::dns::SurveyResolver::new())
         .build()
         .expect("Should be OK")
 }

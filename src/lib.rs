@@ -14,6 +14,8 @@ pub mod arch_desc;
 pub mod country_detect;
 /// Timed HTTP download used to estimate mirror throughput.
 pub mod dl_test;
+/// Name resolution: backend selection plus the survey's resolve/ping hand-off.
+pub mod dns;
 /// Finds the largest package in a mirror's `core` repository.
 pub mod largest_file_discovery;
 /// Types mirroring the `mirrors/status/json/` endpoint plus country codes.

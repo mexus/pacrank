@@ -7,45 +7,65 @@
 //! discovery pipeline filters by.
 
 use std::{
+    collections::HashSet,
     fs,
     net::IpAddr,
     num::NonZeroUsize,
     path::PathBuf,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use display_error_chain::DisplayErrorChain;
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use snafu::{ResultExt, Snafu};
 use time::OffsetDateTime;
-use tokio::sync::Semaphore;
 
-use crate::{APP_USER_AGENT, CountryCode, Mirrors};
+use crate::{APP_USER_AGENT, CountryCode, Mirrors, dns::SurveyResolver};
 
-/// Maximum number of mirrors probed concurrently during the survey.
+/// Maximum number of mirrors *pinged* concurrently during the survey.
 ///
-/// Too high and the local link is saturated, distorting every measurement.
-/// 16 leaves headroom on a residential connection while still finishing the
-/// survey in reasonable wall time.
+/// Too high and TLS handshakes contend for CPU, distorting every measurement.
+/// 16 keeps the numbers honest. Name resolution has no such constraint and
+/// runs at its own, much wider limit — see
+/// [`SurveyResolver::lookup_concurrency`].
 const SURVEY_CONCURRENCY: usize = 16;
 
-/// Per-mirror probe budget. Matches the latency phase of the main pipeline.
-const SURVEY_BUDGET: Duration = Duration::from_secs(3);
+/// Per-mirror probe budget.
+///
+/// Sized by the only question the survey answers: is this country within
+/// `threshold` (1.5x) of the baseline? That needs a rough median, not a
+/// precise one — precision is the main pipeline's job, on the ~50 mirrors that
+/// survive this screen.
+///
+/// At [`SURVEY_INTERVAL`] a *nearby* mirror fits four probes in here. The
+/// first pays TCP connect and the TLS handshake; the rest reuse the pooled
+/// connection, and the median of four (index 2 of a sorted 4) discards that
+/// cold sample. Those are exactly the mirrors whose numbers decide anything.
+///
+/// A distant mirror fits fewer, and at two its median *is* the cold handshake
+/// sample — `samples[len / 2]` at length 2 is index 1. That inflates far
+/// mirrors, which only pushes them further down a ranking they were losing
+/// anyway, so it is left alone. It is also why this must not be shortened to
+/// the point where near mirrors land in the same trap.
+const SURVEY_BUDGET: Duration = Duration::from_millis(500);
 
 /// Interval between probes against the same mirror (jittered ±10% inside
 /// `ping_url`).
-const SURVEY_INTERVAL: Duration = Duration::from_secs(1);
+///
+/// The main pipeline spaces probes a second apart to sample across time. A
+/// country screen has no use for that spread, and paying for it cost ~2s per
+/// mirror where ~0.5s buys the same verdict.
+const SURVEY_INTERVAL: Duration = Duration::from_millis(150);
 
 /// How long a runtime shutdown is allowed to wait for stragglers.
 ///
 /// Dropping a Tokio runtime blocks until every *running* `spawn_blocking` task
-/// returns, and hyper's default resolver runs `getaddrinfo` there. Probing 800
-/// mirrors abandons plenty of half-finished lookups — the request times out,
-/// but the blocking task keeps polling the DNS socket for another ~20s. The
-/// survey's answer never depends on those, so we cap the wait and let the
-/// stragglers die with the process.
+/// returns. This is not a transitional workaround: on the system-resolver path
+/// — Android, or any host without a usable `/etc/resolv.conf` — `getaddrinfo`
+/// runs on that pool and cannot be cancelled, so an abandoned lookup keeps
+/// polling the DNS socket for up to ~102s after [`crate::dns::LOOKUP_TIMEOUT`]
+/// said we stopped caring. Cap the wait; the stragglers die with the process.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 /// Cached countries are considered fresh for this long even when the public
@@ -185,10 +205,14 @@ pub fn resolve(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectError> {
 }
 
 async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectError> {
+    // The survey warms this resolver ahead of the pings; handing the same
+    // instance to reqwest is what turns those warm-ups into cache hits.
+    let resolver = SurveyResolver::new();
     let client = reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(2))
         .tls_certs_only(crate::tls_roots())
+        .dns_resolver(resolver.clone())
         .build()
         .context(BuildClientSnafu)?;
 
@@ -216,7 +240,7 @@ async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectEr
         return Ok(entry.countries.clone());
     }
 
-    match detect(&client, opts).await {
+    match detect(&client, &resolver, opts).await {
         Ok(countries) => {
             if opts.write_cache
                 && let Some(path) = cache_file
@@ -268,9 +292,10 @@ fn fresh_enough(entry: &CacheEntry) -> bool {
 
 async fn detect(
     client: &reqwest::Client,
+    resolver: &SurveyResolver,
     opts: DetectOptions,
 ) -> Result<Vec<CountryCode>, DetectError> {
-    let samples = survey(client).await?;
+    let samples = survey(client, resolver).await?;
     if samples.is_empty() {
         return Err(DetectError::NoSamplesAndNoCache);
     }
@@ -292,7 +317,10 @@ struct Sample {
     median: Duration,
 }
 
-async fn survey(client: &reqwest::Client) -> Result<Vec<Sample>, DetectError> {
+async fn survey(
+    client: &reqwest::Client,
+    resolver: &SurveyResolver,
+) -> Result<Vec<Sample>, DetectError> {
     let Mirrors::V3(mirrors) = client
         .get("https://archlinux.org/mirrors/status/json/")
         .send()
@@ -304,6 +332,10 @@ async fn survey(client: &reqwest::Client) -> Result<Vec<Sample>, DetectError> {
 
     let max_delay = Duration::from_hours(48);
     let oldest_sync = OffsetDateTime::now_utc() - max_delay;
+    // One entry per host. `http://X` and `https://X` are two mirrors but one
+    // machine in one country, so probing both answers the same question twice;
+    // dropping the duplicates takes ~805 entries down to ~487 for free.
+    let mut seen_hosts = HashSet::new();
     let candidates: Vec<_> = mirrors
         .urls
         .into_iter()
@@ -314,66 +346,74 @@ async fn survey(client: &reqwest::Client) -> Result<Vec<Sample>, DetectError> {
                 && m.delay.is_some_and(|d| d <= max_delay.as_secs() as i64)
         })
         .filter_map(|m| {
+            let host = m.url.host_str()?.to_owned();
             let url = m.url.join("lastsync").ok()?;
-            Some((m.country_code, url))
+            Some((m.country_code, url, host))
         })
+        .filter(|(_, _, host)| seen_hosts.insert(host.clone()))
         .collect();
 
     tracing::info!(
-        "Auto-detecting closest countries by probing {} mirrors (up to {} concurrent).",
+        "Auto-detecting closest countries by probing {} mirrors ({} lookups, {} pings in flight).",
         candidates.len(),
+        resolver.lookup_concurrency(),
         SURVEY_CONCURRENCY,
     );
 
-    let semaphore = Arc::new(Semaphore::new(SURVEY_CONCURRENCY));
-    let mut futs = FuturesUnordered::new();
-    for (country, url) in &candidates {
-        let sem = Arc::clone(&semaphore);
-        let client = client.clone();
-        let country = *country;
-        let url = url.clone();
-        futs.push(async move {
-            let _permit = sem
-                .acquire_owned()
-                .await
-                .expect("Semaphore is never closed");
-            let deadline = Instant::now() + SURVEY_BUDGET;
-            let stream = crate::ping_test::ping_url(&client, url, SURVEY_INTERVAL, deadline);
-            let mut samples: Vec<Duration> = Vec::new();
-            futures_util::pin_mut!(stream);
-            while let Some(result) = stream.next().await {
-                if let Ok(d) = result {
-                    samples.push(d);
-                }
-            }
-            (country, samples)
-        });
-    }
-
-    // Progress UI: a count/ETA bar plus a live leaderboard of the closest
-    // countries seen so far. Both bars clear on finish; the surrounding
+    // Progress UI: an ETA bar over resolution — every candidate passes through
+    // it, so it doubles as overall progress — plus a live leaderboard of the
+    // closest countries seen so far. Both clear on finish; the surrounding
     // `tracing::info!` calls are the durable log record.
     let progress = MultiProgress::new();
-    let bar = progress.add(
+    let resolve_bar = progress.add(
         ProgressBar::new(candidates.len() as u64).with_style(
             ProgressStyle::with_template(
-                "  Surveyed {pos:.cyan}/{len:.green} {bar:30.cyan/blue} \
+                "  Resolved {pos:.cyan}/{len:.green} {bar:30.cyan/blue} \
                  (elapsed {elapsed}, eta {eta})",
             )
             .expect("Template must be OK"),
         ),
     );
-    bar.enable_steady_tick(Duration::from_millis(120));
-    let leaders_bar = progress.add(ProgressBar::new_spinner().with_style(
-        ProgressStyle::with_template("  Closest so far: {msg}").expect("Template must be OK"),
-    ));
+    resolve_bar.enable_steady_tick(Duration::from_millis(120));
+    let leaders_bar = progress.add(
+        ProgressBar::new_spinner().with_style(
+            ProgressStyle::with_template("  Pinged {pos:.cyan} · closest so far: {msg}")
+                .expect("Template must be OK"),
+        ),
+    );
     leaders_bar.enable_steady_tick(Duration::from_millis(120));
     leaders_bar.set_message("(awaiting first samples)");
 
+    // Two stages, two widths, no barrier between them: a mirror enters the
+    // ping stage the moment *its own* name resolves. `buffer_unordered` also
+    // supplies the backpressure — resolution runs at most one buffer ahead of
+    // pinging and then waits, so a fast DNS server cannot run away with the
+    // whole list.
+    let pings = futures_util::stream::iter(candidates)
+        .map(|(country, url, host)| {
+            let resolver = resolver.clone();
+            let resolve_bar = resolve_bar.clone();
+            async move {
+                let resolved = resolver.warm(&host).await;
+                resolve_bar.inc(1);
+                // A name that will not resolve costs one lookup here instead
+                // of a whole ping budget downstream.
+                resolved.then_some((country, url))
+            }
+        })
+        .buffer_unordered(resolver.lookup_concurrency())
+        .filter_map(std::future::ready)
+        .map(|(country, url)| {
+            let client = client.clone();
+            async move { (country, probe(&client, url).await) }
+        })
+        .buffer_unordered(SURVEY_CONCURRENCY);
+    futures_util::pin_mut!(pings);
+
     let mut results = Vec::new();
     let mut leaders: Vec<(CountryCode, Duration)> = Vec::new();
-    while let Some((country, mut samples)) = futs.next().await {
-        bar.inc(1);
+    while let Some((country, mut samples)) = pings.next().await {
+        leaders_bar.inc(1);
         if samples.is_empty() {
             continue;
         }
@@ -383,11 +423,28 @@ async fn survey(client: &reqwest::Client) -> Result<Vec<Sample>, DetectError> {
         leaders_bar.set_message(format_leaders(&leaders));
         results.push(Sample { country, median });
     }
-    bar.finish_and_clear();
+    resolve_bar.finish_and_clear();
     leaders_bar.finish_and_clear();
     drop(progress);
 
     Ok(results)
+}
+
+/// Probes one mirror for [`SURVEY_BUDGET`] and returns its raw latency samples.
+///
+/// The name is already in the resolver's cache by the time this runs, so the
+/// first probe pays connect and TLS but never DNS.
+async fn probe(client: &reqwest::Client, url: url::Url) -> Vec<Duration> {
+    let deadline = Instant::now() + SURVEY_BUDGET;
+    let stream = crate::ping_test::ping_url(client, url, SURVEY_INTERVAL, deadline);
+    futures_util::pin_mut!(stream);
+    let mut samples = Vec::new();
+    while let Some(result) = stream.next().await {
+        if let Ok(d) = result {
+            samples.push(d);
+        }
+    }
+    samples
 }
 
 /// Maintains an in-place top-3 leaderboard keyed on best-seen median per

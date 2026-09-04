@@ -43,5 +43,11 @@ url = { version = "2.5.8", features = ["serde"] }
 webpki-root-certs = "1.0.7"
 zstd = "0.13.3"
 
+# Android has no `/etc/resolv.conf` for hickory to read, and bionic's
+# `getaddrinfo` is the only thing that knows the per-network DNS config — so
+# that target uses the system resolver and does not carry this at all.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+hickory-resolver = "0.26.2"
+
 # # TUI
 # ratatui = "0.30.0"
