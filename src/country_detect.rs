@@ -38,6 +38,16 @@ const SURVEY_BUDGET: Duration = Duration::from_secs(3);
 /// `ping_url`).
 const SURVEY_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How long a runtime shutdown is allowed to wait for stragglers.
+///
+/// Dropping a Tokio runtime blocks until every *running* `spawn_blocking` task
+/// returns, and hyper's default resolver runs `getaddrinfo` there. Probing 800
+/// mirrors abandons plenty of half-finished lookups — the request times out,
+/// but the blocking task keeps polling the DNS socket for another ~20s. The
+/// survey's answer never depends on those, so we cap the wait and let the
+/// stragglers die with the process.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+
 /// Cached countries are considered fresh for this long even when the public
 /// IP /16 still matches; after this we re-detect to catch shifts in the
 /// mirror network (mirrors going dark, new ones coming online).
@@ -168,7 +178,10 @@ pub fn resolve(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectError> {
         .enable_all()
         .build()
         .context(BuildRuntimeSnafu)?;
-    rt.block_on(resolve_async(opts))
+    let result = rt.block_on(resolve_async(opts));
+    // Never a plain `drop(rt)` — see `SHUTDOWN_GRACE`.
+    rt.shutdown_timeout(SHUTDOWN_GRACE);
+    result
 }
 
 async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectError> {

@@ -351,7 +351,11 @@ fn discover_best_mirrors(
         .enable_all()
         .build()
         .whatever_context("Can't initialize Tokio")?;
-    rt.block_on(discover_best_mirrors_impl(dl_k, ping_k, countries))
+    let result = rt.block_on(discover_best_mirrors_impl(dl_k, ping_k, countries));
+    // Never a plain `drop(rt)`: it would block until every abandoned
+    // `getaddrinfo` blocking task returns. See `country_detect::SHUTDOWN_GRACE`.
+    rt.shutdown_timeout(Duration::from_millis(100));
+    result
 }
 
 /// Per-mirror bookkeeping threaded through the discovery pipeline.
