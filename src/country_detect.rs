@@ -78,6 +78,23 @@ const SETUP_TIMEOUT_INITIAL: Duration = Duration::from_secs(1);
 /// which is also why the cap's fast-mirror bias is safe to embrace.
 const SETUP_TIMEOUT_FLOOR: Duration = Duration::from_millis(400);
 
+/// Multiple of the warm median beyond which a mirror's connection setup
+/// stops looking like a direct TCP + TLS handshake.
+///
+/// A direct mirror's cold probe costs ~3–4× its round-trip (TCP, TLS, then
+/// the request) plus a few ms of crypto; observed honest mirrors sit at
+/// 2–2.5×. A ratio past 5 means TLS terminated somewhere much closer than
+/// the machine that actually answers — a CDN/anycast edge — and the warm
+/// median then measures the edge (or its cache), not the mirror, e.g.
+/// `mirror.krfoss.org`: Cloudflare-fronted, labelled KR, 6.8× from here.
+const CDN_SUSPECT_RATIO: u32 = 5;
+
+/// Below this setup time the ratio test is meaningless: for very near
+/// mirrors the fixed costs (TLS crypto, server work) dominate the setup, so
+/// a perfectly direct 3ms-median mirror can post a ratio of 8. No CDN
+/// verdict is worth making under 100ms of setup.
+const CDN_SUSPECT_SETUP_FLOOR: Duration = Duration::from_millis(100);
+
 /// How long a runtime shutdown is allowed to wait for stragglers.
 ///
 /// Dropping a Tokio runtime blocks until every *running* `spawn_blocking` task
@@ -456,6 +473,20 @@ async fn survey(
         }
         warm.sort_unstable();
         let median = warm[warm.len() / 2];
+        // Flag-first for now: the mirror is reported but still counts toward
+        // the verdict. Once a few runs confirm the heuristic only fires on
+        // genuine CDN fronts, the flag should exclude the mirror from
+        // country selection.
+        if let Some(setup) = setup
+            && is_cdn_suspect(setup, median)
+        {
+            tracing::info!(
+                "{} {host}: setup {setup:.2?} is {:.1}x its warm median {median:.2?} — likely a \
+                 CDN/anycast front; its country evidence may be misleading.",
+                country.as_code(),
+                setup.as_secs_f64() / median.as_secs_f64(),
+            );
+        }
         // The per-mirror record behind a country verdict. Cheap to emit and
         // the only way to tell a genuinely close mirror from a mislabelled or
         // misbehaving one after the fact.
@@ -509,6 +540,13 @@ async fn probe(
         }
     }
     (setup, warm)
+}
+
+/// Whether a mirror's setup/median relationship betrays a CDN or anycast
+/// front rather than a direct connection — see [`CDN_SUSPECT_RATIO`] and
+/// [`CDN_SUSPECT_SETUP_FLOOR`] for the two thresholds and their rationale.
+fn is_cdn_suspect(setup: Duration, median: Duration) -> bool {
+    setup > CDN_SUSPECT_SETUP_FLOOR && setup > median * CDN_SUSPECT_RATIO
 }
 
 /// Maintains an in-place top-3 leaderboard keyed on best-seen median per
@@ -852,6 +890,39 @@ mod test {
         let body = "203.0.113.42\n";
         let ip = parse_plain_ip(body).unwrap();
         assert_eq!(ip, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)));
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn cdn_suspect_flags_edge_terminated_tls() {
+        // The observed anomaly: mirror.krfoss.org, Cloudflare-fronted and
+        // labelled KR, posted 130ms setup on a 19ms warm median (6.8x).
+        assert!(is_cdn_suspect(ms(130), ms(19)));
+    }
+
+    #[test]
+    fn cdn_suspect_spares_direct_mirrors() {
+        // Honest ratios observed in the wild: ~2.3x and ~2x.
+        assert!(!is_cdn_suspect(ms(41), ms(18)));
+        assert!(!is_cdn_suspect(ms(88), ms(44)));
+    }
+
+    #[test]
+    fn cdn_suspect_spares_near_mirrors_despite_high_ratio() {
+        // 3ms median, 30ms setup: ratio 10, but fixed crypto costs dominate
+        // at this range — the absolute floor keeps it trusted.
+        assert!(!is_cdn_suspect(ms(30), ms(3)));
+    }
+
+    #[test]
+    fn cdn_suspect_thresholds_are_strict() {
+        // Exactly at the floor or exactly at the ratio: not suspect.
+        assert!(!is_cdn_suspect(ms(100), ms(10)));
+        assert!(!is_cdn_suspect(ms(500), ms(100)));
+        assert!(is_cdn_suspect(ms(501), ms(100)));
     }
 
     #[test]
