@@ -172,14 +172,20 @@ pub struct Probe {
     pub cold: bool,
 }
 
-/// Runs a HEAD request against the provided URL and measures the time until any
-/// response is received.
+/// Runs a HEAD request against the provided URL and measures the time until a
+/// *successful* response is received.
+///
+/// A non-2xx answer is a failure, not a sample. This is load-bearing: an
+/// edge WAF that dislikes our User-Agent answers 403 straight from the
+/// nearest POP in single-digit milliseconds (`mirror.krfoss.org` does
+/// exactly that), and without the status check those refusals ranked as the
+/// fastest "latencies" in the survey.
 async fn time_to_first_byte_once<T: IntoUrl>(
     client: &reqwest::Client,
     url: T,
 ) -> reqwest::Result<Duration> {
     let start = Instant::now();
-    let _response = client.head(url).send().await?;
+    let _response = client.head(url).send().await?.error_for_status()?;
     Ok(start.elapsed())
 }
 
@@ -381,6 +387,84 @@ mod test {
         let result = jitter_duration(base, 0.5, &mut rng);
 
         assert!(result <= Duration::MAX);
+    }
+
+    /// Serves every request on every connection with `status_line`, e.g.
+    /// `"403 Forbidden"`. Returns the bound address.
+    async fn spawn_static_server(status_line: &'static str) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let response = format!(
+                                    "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\n\r\n"
+                                );
+                                if sock.write_all(response.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    async fn collect_probes(addr: std::net::SocketAddr) -> Vec<Result<Probe, String>> {
+        let client = reqwest::Client::new();
+        let url: url::Url = format!("http://{addr}/lastsync").parse().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let stream = ping_url(
+            &client,
+            url,
+            Duration::from_millis(50),
+            deadline,
+            None,
+            CacheBust::Off,
+        );
+        futures_util::pin_mut!(stream);
+        let mut probes = Vec::new();
+        while let Some(result) = futures_util::StreamExt::next(&mut stream).await {
+            probes.push(result);
+        }
+        probes
+    }
+
+    #[tokio::test]
+    async fn non_success_status_is_an_error_not_a_sample() {
+        // The krfoss failure mode: an edge WAF answering 403 in single-digit
+        // milliseconds must not rank as a fast mirror.
+        let addr = spawn_static_server("403 Forbidden").await;
+        let probes = collect_probes(addr).await;
+        assert!(!probes.is_empty());
+        for probe in probes {
+            assert!(probe.is_err(), "403 must not produce a latency sample");
+        }
+    }
+
+    #[tokio::test]
+    async fn first_success_is_cold_rest_are_warm() {
+        let addr = spawn_static_server("200 OK").await;
+        let probes: Vec<Probe> = collect_probes(addr)
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()
+            .expect("all probes against a 200 server must succeed");
+        assert!(probes.len() >= 2, "expected several probes, got {probes:?}");
+        assert!(probes[0].cold);
+        assert!(probes[1..].iter().all(|p| !p.cold));
     }
 
     #[test]
