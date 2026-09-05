@@ -22,7 +22,8 @@ pub mod largest_file_discovery;
 pub mod mirrors;
 /// Summary statistics (bootstrap confidence intervals) over ping samples.
 pub mod ping_stat;
-/// Repeated latency probing against an HTTP endpoint.
+/// Repeated latency probing against an HTTP endpoint, plus a self-tuning
+/// cap for cold probes.
 pub mod ping_test;
 
 pub use mirrors::{CountryCode, Mirror, Mirrors, MirrorsV3, Protocol};

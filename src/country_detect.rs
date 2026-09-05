@@ -21,7 +21,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use snafu::{ResultExt, Snafu};
 use time::OffsetDateTime;
 
-use crate::{APP_USER_AGENT, CountryCode, Mirrors, dns::SurveyResolver};
+use crate::{
+    APP_USER_AGENT, CountryCode, Mirrors, dns::SurveyResolver, ping_test::AdaptiveTimeout,
+};
 
 /// Maximum number of mirrors *pinged* concurrently during the survey.
 ///
@@ -57,6 +59,24 @@ const SURVEY_BUDGET: Duration = Duration::from_millis(500);
 /// country screen has no use for that spread, and paying for it cost ~2s per
 /// mirror where ~0.5s buys the same verdict.
 const SURVEY_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Starting (and maximum) value of the adaptive cold-probe cap.
+///
+/// Matches the worst case a request could take before the cap existed —
+/// [`SURVEY_BUDGET`] plus the 500ms per-request grace inside `ping_url` — so
+/// until the first setup samples arrive, behavior is identical to the fixed
+/// cap.
+const SETUP_TIMEOUT_INITIAL: Duration = Duration::from_secs(1);
+
+/// The tightest the adaptive cold-probe cap may get.
+///
+/// A cold answer must land by [`SURVEY_BUDGET`] − [`SURVEY_INTERVAL`]
+/// (~350ms, ±jitter) for a warm probe to still be scheduled; any later and
+/// the mirror is dropped as setup-only regardless of what it said. 400ms
+/// sits above that line, so however hard nearby samples pull the mean down,
+/// the cap cannot censor a mirror that could still influence the verdict —
+/// which is also why the cap's fast-mirror bias is safe to embrace.
+const SETUP_TIMEOUT_FLOOR: Duration = Duration::from_millis(400);
 
 /// How long a runtime shutdown is allowed to wait for stragglers.
 ///
@@ -384,6 +404,11 @@ async fn survey(
     leaders_bar.enable_steady_tick(Duration::from_millis(120));
     leaders_bar.set_message("(awaiting first samples)");
 
+    // One cap shared by every cold probe of this run: each setup sample
+    // tightens it, so hopeless mirrors release their survey slot sooner as
+    // the run learns the local latency landscape.
+    let setup_timeout = AdaptiveTimeout::new(SETUP_TIMEOUT_INITIAL, SETUP_TIMEOUT_FLOOR);
+
     // Two stages, two widths, no barrier between them: a mirror enters the
     // ping stage the moment *its own* name resolves. `buffer_unordered` also
     // supplies the backpressure — resolution runs at most one buffer ahead of
@@ -405,7 +430,8 @@ async fn survey(
         .filter_map(std::future::ready)
         .map(|(country, url, host)| {
             let client = client.clone();
-            async move { (country, host, probe(&client, url).await) }
+            let setup_timeout = setup_timeout.clone();
+            async move { (country, host, probe(&client, url, setup_timeout).await) }
         })
         .buffer_unordered(SURVEY_CONCURRENCY);
     futures_util::pin_mut!(pings);
@@ -449,6 +475,11 @@ async fn survey(
     if setup_only > 0 {
         tracing::info!("{setup_only} mirrors dropped as setup-only (only the cold probe answered).");
     }
+    tracing::debug!(
+        "Adaptive cold-probe cap settled at {:.2?} after cutting {} probes.",
+        setup_timeout.current(),
+        setup_timeout.timeouts(),
+    );
     Ok(results)
 }
 
@@ -457,9 +488,14 @@ async fn survey(
 ///
 /// The name is already in the resolver's cache by the time this runs, so the
 /// cold probe pays connect and TLS but never DNS.
-async fn probe(client: &reqwest::Client, url: url::Url) -> (Option<Duration>, Vec<Duration>) {
+async fn probe(
+    client: &reqwest::Client,
+    url: url::Url,
+    setup_timeout: AdaptiveTimeout,
+) -> (Option<Duration>, Vec<Duration>) {
     let deadline = Instant::now() + SURVEY_BUDGET;
-    let stream = crate::ping_test::ping_url(client, url, SURVEY_INTERVAL, deadline);
+    let stream =
+        crate::ping_test::ping_url(client, url, SURVEY_INTERVAL, deadline, Some(setup_timeout));
     futures_util::pin_mut!(stream);
     let mut setup = None;
     let mut warm = Vec::new();

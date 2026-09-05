@@ -1,9 +1,131 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 use display_error_chain::DisplayErrorChain;
 use futures_util::Stream;
 use rand::{Rng, RngExt};
 use reqwest::IntoUrl;
+
+/// A self-tuning cap for cold probes, shared by every stream of one
+/// measurement run.
+///
+/// Starts at `initial` and, as cold probes succeed, tightens toward
+/// `mean + 2 × deviation` of the observed setup latencies, clamped to
+/// `[floor, initial]` — so a request that hangs stops holding a concurrency
+/// slot for the full worst case once the run has learned what "normal" looks
+/// like. The smoothing follows RFC 6298 (TCP's RTO estimator: gain 1/8 for
+/// the mean, 1/4 for the deviation), with two departures. The multiplier is
+/// 2 rather than 4: RTO protects a single connection from spurious
+/// retransmits, while this cap governs a whole population whose deviation is
+/// naturally large, and the caller's `floor` is what guarantees no
+/// decision-relevant probe gets censored. And a probe cut off by the cap
+/// feeds back as a synthetic sample at *twice* the cap's current value — the
+/// RFC's own backoff-by-doubling, which also clears the integer smoothing's
+/// deadzone — so repeated timeouts push the cap up, breaking the
+/// survivorship spiral where an over-tight cap censors the very samples that
+/// would have widened it.
+///
+/// Cheap to clone; clones share one state. Millisecond granularity, and the
+/// integer smoothing settles within a few ms of the true mean — plenty for a
+/// timeout.
+#[derive(Clone)]
+pub struct AdaptiveTimeout {
+    inner: Arc<TimeoutState>,
+}
+
+struct TimeoutState {
+    /// `(mean_ms << 32) | deviation_ms`; `0` means "no samples yet" (a real
+    /// sample is never recorded below 1ms). Packing the pair into one atomic
+    /// keeps mean and deviation consistent without a lock.
+    state: AtomicU64,
+    /// How many probes the cap has cut off — the direct measure of whether
+    /// the mechanism is earning its keep on this network.
+    cuts: AtomicU64,
+    initial: Duration,
+    floor: Duration,
+}
+
+impl AdaptiveTimeout {
+    /// `initial` doubles as the ceiling; `floor` is the tightest the cap may
+    /// get and belongs to the caller, who knows below which point a slow
+    /// answer could still have mattered.
+    pub fn new(initial: Duration, floor: Duration) -> Self {
+        assert!(floor <= initial, "floor must not exceed initial");
+        Self {
+            inner: Arc::new(TimeoutState {
+                state: AtomicU64::new(0),
+                cuts: AtomicU64::new(0),
+                initial,
+                floor,
+            }),
+        }
+    }
+
+    /// How many probes the cap has cut off so far.
+    pub fn timeouts(&self) -> u64 {
+        self.inner.cuts.load(Ordering::Relaxed)
+    }
+
+    /// The cap's current value.
+    pub fn current(&self) -> Duration {
+        match self.inner.state.load(Ordering::Relaxed) {
+            0 => self.inner.initial,
+            state => {
+                let (mean, dev) = unpack(state);
+                Duration::from_millis(u64::from(mean) + 2 * u64::from(dev))
+                    .clamp(self.inner.floor, self.inner.initial)
+            }
+        }
+    }
+
+    /// Records a successful cold probe's latency.
+    pub fn observe(&self, setup: Duration) {
+        let sample = u32::try_from(setup.as_millis()).unwrap_or(u32::MAX).max(1);
+        let _ = self
+            .inner
+            .state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+                Some(if state == 0 {
+                    // RFC 6298 initialization: deviation starts at half the
+                    // first sample.
+                    pack(sample, sample / 2)
+                } else {
+                    let (mean, dev) = unpack(state);
+                    let (mean, dev) = (i64::from(mean), i64::from(dev));
+                    let sample = i64::from(sample);
+                    // Deviation first, from the pre-update mean — RFC 6298
+                    // order.
+                    let dev = dev + ((sample - mean).abs() - dev) / 4;
+                    let mean = mean + (sample - mean) / 8;
+                    pack(saturate_u32(mean).max(1), saturate_u32(dev))
+                })
+            });
+    }
+
+    /// Records a cold probe cut off by the cap — see the type docs for why
+    /// timeouts feed back at twice the cap's current value.
+    pub fn observe_timeout(&self) {
+        self.inner.cuts.fetch_add(1, Ordering::Relaxed);
+        self.observe(self.current().saturating_mul(2));
+    }
+}
+
+fn pack(mean: u32, dev: u32) -> u64 {
+    (u64::from(mean) << 32) | u64::from(dev)
+}
+
+fn unpack(state: u64) -> (u32, u32) {
+    ((state >> 32) as u32, state as u32)
+}
+
+fn saturate_u32(value: i64) -> u32 {
+    value.clamp(0, i64::from(u32::MAX)) as u32
+}
 
 /// One successful latency measurement out of [`ping_url`].
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +165,13 @@ async fn time_to_first_byte_once<T: IntoUrl>(
 /// stalled request cannot drag the ping phase past its deadline. The stream
 /// terminates once `Instant::now() >= until`.
 ///
+/// When `setup_timeout` is provided, the stream's cold request is
+/// additionally capped by the timeout's current value, and its outcome —
+/// latency or cut-off — is fed back in. Warm requests neither consult nor
+/// feed it: hangs are overwhelmingly a cold-request phenomenon (SYN
+/// blackholes, TLS stalls), and mixing warm round-trips into the average
+/// would strangle every cold probe.
+///
 /// # Note
 ///
 /// Requires a Tokio runtime — uses `tokio::time`.
@@ -51,6 +180,7 @@ pub fn ping_url<T: IntoUrl + Clone>(
     url: T,
     interval: Duration,
     until: Instant,
+    setup_timeout: Option<AdaptiveTimeout>,
 ) -> impl Stream<Item = Result<Probe, String>> {
     // OS-seeded: we only use it for timing jitter, not anything reproducible.
     let mut rng: rand::rngs::StdRng = rand::make_rng();
@@ -63,6 +193,7 @@ pub fn ping_url<T: IntoUrl + Clone>(
             // refcount bump — cheaper than threading a shared borrow through the
             // async state machine.
             let client = client.clone();
+            let setup_timeout = setup_timeout.clone();
             async move {
                 if !is_first {
                     let next_ping = last_request + interval;
@@ -72,30 +203,48 @@ pub fn ping_url<T: IntoUrl + Clone>(
                     tokio::time::sleep_until(next_ping.into()).await;
                 }
 
-                // `timeout_at(until, ...)` caps the request at the phase
-                // deadline: a hung connection gets cancelled instead of
-                // bleeding into the next phase.
-                let result = tokio::time::timeout_at(
-                    tokio::time::Instant::from(until) + Duration::from_millis(500),
+                let is_cold = !had_success;
+                // In play only for the cold request; `None` past that point.
+                let setup_timeout = setup_timeout.filter(|_| is_cold);
+
+                // `timeout_at` caps the request at the phase deadline (plus
+                // grace): a hung connection gets cancelled instead of
+                // bleeding into the next phase. The cold request may be
+                // capped tighter still by the adaptive setup timeout.
+                let mut cap = tokio::time::Instant::from(until) + Duration::from_millis(500);
+                if let Some(timeout) = &setup_timeout {
+                    cap = cap.min(tokio::time::Instant::now() + timeout.current());
+                }
+
+                let result = match tokio::time::timeout_at(
+                    cap,
                     time_to_first_byte_once(&client, url),
                 )
                 .await
-                .map_err(|e| DisplayErrorChain::new(e).to_string())
-                .and_then(|result| result.map_err(|e| DisplayErrorChain::new(e).to_string()));
-
-                // A failed request leaves no pooled connection behind, so the
-                // next success is still the cold one.
-                let (result, had_success) = match result {
-                    Ok(latency) => (
+                {
+                    Ok(Ok(latency)) => {
+                        if let Some(timeout) = &setup_timeout {
+                            timeout.observe(latency);
+                        }
                         Ok(Probe {
                             latency,
-                            cold: !had_success,
-                        }),
-                        true,
-                    ),
-                    Err(e) => (Err(e), had_success),
+                            cold: is_cold,
+                        })
+                    }
+                    // A request *error* says nothing about duration, so it
+                    // does not feed the timeout. It also leaves no pooled
+                    // connection behind, so the next success is still the
+                    // cold one.
+                    Ok(Err(e)) => Err(DisplayErrorChain::new(e).to_string()),
+                    Err(elapsed) => {
+                        if let Some(timeout) = &setup_timeout {
+                            timeout.observe_timeout();
+                        }
+                        Err(DisplayErrorChain::new(elapsed).to_string())
+                    }
                 };
 
+                let had_success = had_success || result.is_ok();
                 Some((result, (false, had_success, Instant::now())))
             }
         },
@@ -198,5 +347,75 @@ mod test {
         let result = jitter_duration(base, 0.5, &mut rng);
 
         assert!(result <= Duration::MAX);
+    }
+
+    #[test]
+    fn adaptive_timeout_starts_at_initial() {
+        let timeout = AdaptiveTimeout::new(Duration::from_secs(1), Duration::from_millis(100));
+        assert_eq!(timeout.current(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn adaptive_timeout_converges_toward_uniform_samples() {
+        let timeout = AdaptiveTimeout::new(Duration::from_secs(1), Duration::from_millis(10));
+        for _ in 0..200 {
+            timeout.observe(Duration::from_millis(50));
+        }
+        // Mean settles at 50ms, deviation decays toward zero (integer
+        // smoothing leaves a few ms of residue).
+        let current = timeout.current();
+        assert!(
+            (Duration::from_millis(50)..=Duration::from_millis(80)).contains(&current),
+            "expected ~50-80ms, got {current:?}"
+        );
+    }
+
+    #[test]
+    fn adaptive_timeout_respects_floor_and_ceiling() {
+        let timeout = AdaptiveTimeout::new(Duration::from_millis(500), Duration::from_millis(200));
+        for _ in 0..100 {
+            timeout.observe(Duration::from_millis(5));
+        }
+        assert_eq!(timeout.current(), Duration::from_millis(200));
+        for _ in 0..100 {
+            timeout.observe(Duration::from_secs(9));
+        }
+        assert_eq!(timeout.current(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn adaptive_timeout_timeouts_push_the_cap_up() {
+        let timeout = AdaptiveTimeout::new(Duration::from_secs(1), Duration::from_millis(10));
+        for _ in 0..200 {
+            timeout.observe(Duration::from_millis(20));
+        }
+        let tightened = timeout.current();
+        for _ in 0..50 {
+            timeout.observe_timeout();
+        }
+        assert!(
+            timeout.current() > tightened,
+            "cut-offs must widen the cap: {tightened:?} -> {:?}",
+            timeout.current()
+        );
+    }
+
+    #[test]
+    fn adaptive_timeout_counts_only_cut_offs() {
+        let timeout = AdaptiveTimeout::new(Duration::from_secs(1), Duration::from_millis(10));
+        timeout.observe(Duration::from_millis(50));
+        assert_eq!(timeout.timeouts(), 0);
+        timeout.observe_timeout();
+        timeout.observe_timeout();
+        assert_eq!(timeout.timeouts(), 2);
+    }
+
+    #[test]
+    fn adaptive_timeout_submillisecond_sample_is_not_mistaken_for_empty() {
+        let timeout = AdaptiveTimeout::new(Duration::from_secs(1), Duration::from_millis(1));
+        timeout.observe(Duration::from_micros(10));
+        // Had the sample collided with the "no samples" sentinel, current()
+        // would still be the initial 1s.
+        assert!(timeout.current() < Duration::from_secs(1));
     }
 }

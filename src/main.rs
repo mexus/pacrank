@@ -583,6 +583,10 @@ async fn latency_phase(
                 mirror_data.last_sync_url.clone(),
                 Duration::from_secs(1),
                 deadline,
+                // No adaptive cap here: all streams run concurrently under
+                // one fixed deadline, so a hung request holds no scarce slot
+                // and cutting it early would buy nothing.
+                None,
             )
             .map(move |result| (n, result))
         })
