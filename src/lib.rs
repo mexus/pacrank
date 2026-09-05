@@ -30,9 +30,22 @@ pub use mirrors::{CountryCode, Mirror, Mirrors, MirrorsV3, Protocol};
 
 /// HTTP `User-Agent` header sent by every outgoing request.
 ///
-/// Identifying the tool is polite to mirror operators and helps with debugging
-/// on their side. The value is derived at compile time from `Cargo.toml`.
-pub static APP_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"),);
+/// Leads with a `pacman/…` compatibility token — the same convention as
+/// browsers' `Mozilla/5.0` prefix — because some mirrors sit behind WAF
+/// rules that allowlist pacman's UA and answer everything else with an edge
+/// 403 (`mirror.krfoss.org` does exactly that, verified 2026-09: bare
+/// `pacrank/x` → 403, `pacman/7.0.0 pacrank/x` → 200). The claimed pacman
+/// version is nominal, like the `5.0` in `Mozilla/5.0`.
+///
+/// The real identity follows the token: naming the tool is polite to mirror
+/// operators and lets them filter or debug our probe traffic. That part is
+/// derived at compile time from `Cargo.toml`.
+pub static APP_USER_AGENT: &str = concat!(
+    "pacman/7.0.0 ",
+    env!("CARGO_PKG_NAME"),
+    "/",
+    env!("CARGO_PKG_VERSION"),
+);
 
 /// The bundled Mozilla root certificates, ready to hand to
 /// [`reqwest::ClientBuilder::tls_certs_only`].
