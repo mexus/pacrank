@@ -127,6 +127,32 @@ fn saturate_u32(value: i64) -> u32 {
     value.clamp(0, i64::from(u32::MAX)) as u32
 }
 
+/// Whether [`ping_url`] should defeat caches between us and the origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheBust {
+    /// Append a fresh `pacrank-bust=<nonce>` query to every probe, so an
+    /// edge cache can never answer for the origin and each sample measures
+    /// the full path — what unmasks a CDN front masquerading as a near
+    /// mirror. Per *probe*, not per stream: a single nonce would simply get
+    /// cached itself after the first request, fooling every warm sample.
+    PerProbe,
+    /// Probe the URL as given. Whatever answers may be a cache — which is
+    /// the right thing to measure when the user's own requests would hit
+    /// that same cache.
+    Off,
+}
+
+/// Returns `url` with a `pacrank-bust=<nonce>` query pair appended,
+/// preserving any query already present. The parameter name identifies us to
+/// mirror operators reading their access logs.
+fn bust_url(url: &url::Url, nonce: u64) -> url::Url {
+    let mut busted = url.clone();
+    busted
+        .query_pairs_mut()
+        .append_pair("pacrank-bust", &format!("{nonce:016x}"));
+    busted
+}
+
 /// One successful latency measurement out of [`ping_url`].
 #[derive(Debug, Clone, Copy)]
 pub struct Probe {
@@ -172,22 +198,30 @@ async fn time_to_first_byte_once<T: IntoUrl>(
 /// blackholes, TLS stalls), and mixing warm round-trips into the average
 /// would strangle every cold probe.
 ///
+/// `cache_bust` decides whether each probe carries a unique query string —
+/// see [`CacheBust`].
+///
 /// # Note
 ///
 /// Requires a Tokio runtime — uses `tokio::time`.
-pub fn ping_url<T: IntoUrl + Clone>(
+pub fn ping_url(
     client: &reqwest::Client,
-    url: T,
+    url: url::Url,
     interval: Duration,
     until: Instant,
     setup_timeout: Option<AdaptiveTimeout>,
+    cache_bust: CacheBust,
 ) -> impl Stream<Item = Result<Probe, String>> {
-    // OS-seeded: we only use it for timing jitter, not anything reproducible.
+    // OS-seeded: we only use it for timing jitter and cache-busting nonces,
+    // not anything reproducible.
     let mut rng: rand::rngs::StdRng = rand::make_rng();
     futures_util::stream::unfold(
         (true, false, Instant::now()),
         move |(is_first, had_success, last_request)| {
-            let url = url.clone();
+            let url = match cache_bust {
+                CacheBust::PerProbe => bust_url(&url, rng.random()),
+                CacheBust::Off => url.clone(),
+            };
             let interval = jitter_duration(interval, 0.1, &mut rng);
             // `reqwest::Client` is internally `Arc`-based, so cloning is a cheap
             // refcount bump — cheaper than threading a shared borrow through the
@@ -347,6 +381,34 @@ mod test {
         let result = jitter_duration(base, 0.5, &mut rng);
 
         assert!(result <= Duration::MAX);
+    }
+
+    #[test]
+    fn bust_url_appends_nonce_query() {
+        let base: url::Url = "https://mirror.example.org/archlinux/lastsync"
+            .parse()
+            .unwrap();
+        let busted = bust_url(&base, 0xff);
+        assert_eq!(
+            busted.as_str(),
+            "https://mirror.example.org/archlinux/lastsync?pacrank-bust=00000000000000ff"
+        );
+    }
+
+    #[test]
+    fn bust_url_preserves_existing_query() {
+        let base: url::Url = "https://mirror.example.org/lastsync?a=b".parse().unwrap();
+        let busted = bust_url(&base, 1);
+        assert_eq!(
+            busted.as_str(),
+            "https://mirror.example.org/lastsync?a=b&pacrank-bust=0000000000000001"
+        );
+    }
+
+    #[test]
+    fn bust_url_differs_per_nonce() {
+        let base: url::Url = "https://mirror.example.org/lastsync".parse().unwrap();
+        assert_ne!(bust_url(&base, 1), bust_url(&base, 2));
     }
 
     #[test]

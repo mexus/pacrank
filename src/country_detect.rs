@@ -22,7 +22,9 @@ use snafu::{ResultExt, Snafu};
 use time::OffsetDateTime;
 
 use crate::{
-    APP_USER_AGENT, CountryCode, Mirrors, dns::SurveyResolver, ping_test::AdaptiveTimeout,
+    APP_USER_AGENT, CountryCode, Mirrors,
+    dns::SurveyResolver,
+    ping_test::{AdaptiveTimeout, CacheBust},
 };
 
 /// Maximum number of mirrors *pinged* concurrently during the survey.
@@ -473,10 +475,9 @@ async fn survey(
         }
         warm.sort_unstable();
         let median = warm[warm.len() / 2];
-        // Flag-first for now: the mirror is reported but still counts toward
-        // the verdict. Once a few runs confirm the heuristic only fires on
-        // genuine CDN fronts, the flag should exclude the mirror from
-        // country selection.
+        // Log-only canary. Cache-busted probes should make a CDN front
+        // measure as far, so this firing means some cache answered busted
+        // URLs anyway — worth knowing, but the mirror keeps its vote.
         if let Some(setup) = setup
             && is_cdn_suspect(setup, median)
         {
@@ -519,14 +520,25 @@ async fn survey(
 ///
 /// The name is already in the resolver's cache by the time this runs, so the
 /// cold probe pays connect and TLS but never DNS.
+///
+/// Probes are cache-busted: an edge cache must traverse to the origin for
+/// every sample, so a CDN front cannot masquerade as a near mirror by
+/// answering from a nearby cache (the `mirror.krfoss.org` case). Direct
+/// mirrors serve the same file either way.
 async fn probe(
     client: &reqwest::Client,
     url: url::Url,
     setup_timeout: AdaptiveTimeout,
 ) -> (Option<Duration>, Vec<Duration>) {
     let deadline = Instant::now() + SURVEY_BUDGET;
-    let stream =
-        crate::ping_test::ping_url(client, url, SURVEY_INTERVAL, deadline, Some(setup_timeout));
+    let stream = crate::ping_test::ping_url(
+        client,
+        url,
+        SURVEY_INTERVAL,
+        deadline,
+        Some(setup_timeout),
+        CacheBust::PerProbe,
+    );
     futures_util::pin_mut!(stream);
     let mut setup = None;
     let mut warm = Vec::new();

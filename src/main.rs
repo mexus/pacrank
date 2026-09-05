@@ -587,6 +587,10 @@ async fn latency_phase(
                 // one fixed deadline, so a hung request holds no scarce slot
                 // and cutting it early would buy nothing.
                 None,
+                // No busting either: pacman's own requests would be served
+                // by the same caches, so the cached path *is* the
+                // user-visible latency this phase ranks by.
+                pacrank::ping_test::CacheBust::Off,
             )
             .map(move |result| (n, result))
         })
