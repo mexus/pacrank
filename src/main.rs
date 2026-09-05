@@ -399,14 +399,19 @@ impl MirrorData<PingStatRunning> {
         })
     }
 
-    /// Finalizes the ping statistics and transitions to the post-latency phase.
-    pub fn compute_pings<R: ?Sized + Rng>(&self, rng: &mut R) -> MirrorData<PingStatComputed> {
-        MirrorData {
+    /// Finalizes the ping statistics and transitions to the post-latency
+    /// phase, or `None` when the mirror produced no warm samples to compute
+    /// statistics over.
+    pub fn compute_pings<R: ?Sized + Rng>(
+        &self,
+        rng: &mut R,
+    ) -> Option<MirrorData<PingStatComputed>> {
+        Some(MirrorData {
             mirror: self.mirror.clone(),
             last_sync_url: self.last_sync_url.clone(),
-            ping_stat: self.ping_stat.compute(rng),
+            ping_stat: self.ping_stat.compute(rng)?,
             dl_speed: self.dl_speed,
-        }
+        })
     }
 }
 
@@ -435,8 +440,12 @@ async fn discover_best_mirrors_impl(
     ping_k: NonZeroUsize,
     countries: &[CountryCode],
 ) -> Result<Vec<Url>, snafu::Whatever> {
-    let client = build_client();
+    // Kept out of `build_client` so the resolve phase can warm the very
+    // cache the client will later read from.
+    let resolver = pacrank::dns::SurveyResolver::new();
+    let client = build_client(resolver.clone());
     let mirrors = fetch_and_filter_mirrors(&client, countries).await?;
+    let mirrors = resolve_phase(&resolver, mirrors).await?;
     let mirrors = latency_phase(&client, mirrors, Duration::from_secs(3)).await;
     let mirrors = compute_and_filter_pings(mirrors, ping_k)?;
     let mirrors = throughput_phase(&client, mirrors).await;
@@ -448,15 +457,12 @@ async fn discover_best_mirrors_impl(
 /// Single shared client for the whole pipeline: one connection pool, one UA,
 /// one connect timeout. HTTP keep-alive across `core.db` → largest-package
 /// downloads to the same mirror is a nice side effect.
-fn build_client() -> reqwest::Client {
+fn build_client(resolver: pacrank::dns::SurveyResolver) -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
         .connect_timeout(Duration::from_secs(2))
         .tls_certs_only(pacrank::tls_roots())
-        // Not for the cache — this phase sees few enough mirrors that it
-        // hardly matters — but so that an unresponsive name is a cancellable
-        // future rather than a blocking thread that outlives the runtime.
-        .dns_resolver(pacrank::dns::SurveyResolver::new())
+        .dns_resolver(resolver)
         .build()
         .expect("Should be OK")
 }
@@ -518,6 +524,38 @@ fn format_countries(countries: &[CountryCode]) -> String {
         .join(", ")
 }
 
+/// Phase 1b: resolves every mirror's hostname into the shared resolver cache
+/// and drops mirrors whose names don't resolve.
+///
+/// The same split the survey performs (see `country_detect`): with the cache
+/// warm, no ping sample ever includes DNS time — the client reads addresses
+/// straight from the cache — and a dead name costs one lookup here instead of
+/// occupying a whole ping stream for the phase. The `http://X` / `https://X`
+/// twins of one host collapse into a single lookup for free.
+async fn resolve_phase(
+    resolver: &pacrank::dns::SurveyResolver,
+    mirrors: Vec<MirrorData<PingStatRunning>>,
+) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
+    let total = mirrors.len();
+    let resolved: Vec<_> = futures_util::stream::iter(mirrors)
+        .map(|data| {
+            // Owned copy: `warm` must not borrow from the `data` the future
+            // moves out on success.
+            let host = data.mirror.url.host_str().map(str::to_owned);
+            async move {
+                let host = host?;
+                resolver.warm(&host).await.then_some(data)
+            }
+        })
+        .buffer_unordered(resolver.lookup_concurrency())
+        .filter_map(std::future::ready)
+        .collect()
+        .await;
+    snafu::ensure_whatever!(!resolved.is_empty(), "No mirror hostname resolved");
+    tracing::info!("Name resolution kept {}/{total} mirrors", resolved.len());
+    Ok(resolved)
+}
+
 /// Phase 2a: probes every mirror's `lastsync` URL for `duration`, recording
 /// per-probe latency (or errors) into each mirror's [`PingStatRunning`].
 async fn latency_phase(
@@ -527,6 +565,14 @@ async fn latency_phase(
 ) -> Vec<MirrorData<PingStatRunning>> {
     // Deadline shared by every ping stream and by each individual request
     // (see `ping_url` for the per-request timeout).
+    //
+    // Follow-up, deliberately not done yet: every stream fires its first —
+    // cold — probe at the same instant, so a large country opens on the order
+    // of a hundred TLS handshakes at once and they contend for CPU. Cold
+    // samples no longer feed the ranking statistics, so today this only
+    // pollutes the setup figures; if those ever start to matter, stagger the
+    // first probes across `[0, interval)` — that spreads the burst without
+    // costing wall time.
     let deadline = Instant::now() + duration;
     let streams = mirrors
         .iter()
@@ -546,9 +592,14 @@ async fn latency_phase(
     while let Some((n, result)) = pings.next().await {
         let mirror_data = &mut mirrors[n];
         match result {
-            Ok(duration) => {
-                mirror_data.ping_stat.record_ping(duration);
-                tracing::debug!("{}: {duration:?}", mirror_data.mirror.url);
+            Ok(probe) => {
+                tracing::debug!(
+                    "{}: {:?}{}",
+                    mirror_data.mirror.url,
+                    probe.latency,
+                    if probe.cold { " (setup)" } else { "" },
+                );
+                mirror_data.ping_stat.record_ping(probe);
             }
             Err(err) => {
                 mirror_data.ping_stat.record_error();
@@ -569,24 +620,50 @@ fn compute_and_filter_pings(
     // confidence intervals for the same inputs across runs — useful when
     // comparing two invocations made minutes apart.
     let mut rng = rand::rngs::StdRng::seed_from_u64(1337);
-    let mut kept = mirrors
-        .into_iter()
-        .map(|data| data.compute_pings(&mut rng))
+    // A mirror whose only success was the cold probe is dropped outright
+    // rather than judged by its handshake sample. The count below is a
+    // provisional metric watching that policy's cost: if it stays high, the
+    // alternative is to fall back to the setup sample for such mirrors.
+    let mut setup_only = 0usize;
+    let mut kept = Vec::new();
+    for data in &mirrors {
+        let Some(computed) = data.compute_pings(&mut rng) else {
+            // `compute_pings` returned `None`, so there are no warm samples;
+            // a recorded setup is what makes this the setup-only case rather
+            // than a fully dead mirror.
+            if let Some(setup) = data.ping_stat.setup() {
+                setup_only += 1;
+                tracing::debug!(
+                    "{}: dropped as setup-only, setup = {setup:.2?}",
+                    data.mirror.url
+                );
+            }
+            continue;
+        };
         // Anything slower than 1s median is not worth the download test.
-        .filter(|data| data.ping_stat.median() <= Duration::from_secs(1))
-        .collect::<Vec<_>>();
+        if computed.ping_stat.median() <= Duration::from_secs(1) {
+            kept.push(computed);
+        }
+    }
     snafu::ensure_whatever!(!kept.is_empty(), "No servers to continue with");
     kept.sort_by_key(|m| m.ping_stat.median());
     kept.truncate(ping_k.get());
-    tracing::info!("Latency phase finished, kept {} mirrors", kept.len());
+    tracing::info!(
+        "Latency phase finished, kept {} mirrors ({setup_only} dropped as setup-only)",
+        kept.len()
+    );
     if tracing::enabled!(tracing::Level::DEBUG) {
         for data in &kept {
             let low = data.ping_stat.low();
             let high = data.ping_stat.high();
             let median = data.ping_stat.median();
+            let setup = data
+                .ping_stat
+                .setup()
+                .map_or_else(|| "n/a".to_owned(), |s| format!("{s:.2?}"));
             tracing::debug!(
                 { %data.mirror.url },
-                "90% in {low:.2?}..{high:.2?}, median = {median:.2?}",
+                "90% in {low:.2?}..{high:.2?}, median = {median:.2?}, setup = {setup}",
             );
         }
     }

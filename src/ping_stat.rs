@@ -2,14 +2,24 @@ use std::time::Duration;
 
 use rand::{Rng, RngExt};
 
+use crate::ping_test::Probe;
+
 /// Accumulates raw latency samples during the ping phase.
 ///
 /// Call [`record_ping`](Self::record_ping) for each successful probe and
 /// [`record_error`](Self::record_error) for failures; then turn the accumulator
 /// into a [`PingStatComputed`] summary via [`compute`](Self::compute).
+///
+/// Cold and warm probes (see [`Probe::cold`]) land in separate buckets: the
+/// cold one becomes the mirror's *setup* figure, and only warm samples feed
+/// the bootstrap statistics. The distinction matters because the statistics
+/// run over the **mean** — with a handful of samples, one connection setup
+/// (TCP + TLS, easily several times the request round-trip) would visibly
+/// skew the headline number where a median would have shrugged it off.
 #[derive(Debug, Default)]
 pub struct PingStatRunning {
-    durations: Vec<Duration>,
+    warm: Vec<Duration>,
+    setup: Option<Duration>,
     errors: usize,
 }
 
@@ -23,6 +33,7 @@ pub struct PingStatComputed {
     low: Duration,
     high: Duration,
     median: Duration,
+    setup: Option<Duration>,
     errors: usize,
 }
 
@@ -45,6 +56,14 @@ impl PingStatComputed {
         self.median
     }
 
+    /// Latency of the cold probe: connection setup (TCP + TLS) plus one
+    /// request round-trip. `None` when no cold probe succeeded — possible in
+    /// principle, though a stream that produced warm samples must have had a
+    /// cold success first.
+    pub fn setup(&self) -> Option<Duration> {
+        self.setup
+    }
+
     /// Number of probes that failed entirely (no duration recorded).
     pub fn errors(&self) -> usize {
         self.errors
@@ -52,9 +71,17 @@ impl PingStatComputed {
 }
 
 impl PingStatRunning {
-    /// Records a successful probe's round-trip duration.
-    pub fn record_ping(&mut self, duration: Duration) {
-        self.durations.push(duration);
+    /// Records a successful probe.
+    ///
+    /// A cold probe is stored as the setup figure (first one wins — a
+    /// well-formed probe stream produces at most one anyway); warm probes
+    /// accumulate as statistics samples.
+    pub fn record_ping(&mut self, probe: Probe) {
+        if probe.cold {
+            self.setup.get_or_insert(probe.latency);
+        } else {
+            self.warm.push(probe.latency);
+        }
     }
 
     /// Records one failed probe (e.g. connection error, timeout).
@@ -67,27 +94,44 @@ impl PingStatRunning {
         self.errors
     }
 
-    /// Finalizes the running statistics into an immutable [`PingStatComputed`].
+    /// Latency of the cold probe recorded so far, if any — see
+    /// [`PingStatComputed::setup`].
+    pub fn setup(&self) -> Option<Duration> {
+        self.setup
+    }
+
+    /// Whether the only success was the cold probe — the mirror answered
+    /// once, paid the handshake, and never produced a warm sample.
+    pub fn is_setup_only(&self) -> bool {
+        self.setup.is_some() && self.warm.is_empty()
+    }
+
+    /// Finalizes the running statistics into an immutable [`PingStatComputed`],
+    /// or `None` when there are no warm samples to compute statistics over.
     ///
     /// Runs the bootstrap resampling once; the provided `rng` drives the
     /// resampling draws.
-    pub fn compute<R>(&self, rng: &mut R) -> PingStatComputed
+    pub fn compute<R>(&self, rng: &mut R) -> Option<PingStatComputed>
     where
         R: Rng + ?Sized,
     {
+        if self.warm.is_empty() {
+            return None;
+        }
         let (low, median, high) = self.bootstrap_range(rng);
-        PingStatComputed {
+        Some(PingStatComputed {
             low,
             high,
             median,
+            setup: self.setup,
             errors: self.errors,
-        }
+        })
     }
 
-    /// Returns a 90% confidence range around the mean latency as
-    /// `(p05, median, p95)`.
+    /// Returns a 90% confidence range around the mean latency of the warm
+    /// samples as `(p05, median, p95)`.
     ///
-    /// Uses non-parametric bootstrap resampling: draw `durations.len()`
+    /// Uses non-parametric bootstrap resampling: draw `warm.len()`
     /// samples with replacement from the observed samples, take the mean,
     /// repeat `REPEATS` times, then read off the 5th / 50th / 95th
     /// percentiles of the collected means. This gives a distribution-free
@@ -96,27 +140,26 @@ impl PingStatRunning {
     pub fn bootstrap_range<R: Rng + ?Sized>(&self, rng: &mut R) -> (Duration, Duration, Duration) {
         const REPEATS: usize = 10_000;
 
-        let durations_count = self.durations.len();
+        let warm_count = self.warm.len();
         // Degenerate cases: no point resampling if there's nothing to sample
         // from, or only one sample (every resample returns the same value).
-        if durations_count == 0 {
+        if warm_count == 0 {
             return (Duration::MAX, Duration::MAX, Duration::MAX);
-        } else if durations_count == 1 {
-            let the_only = self.durations[0];
+        } else if warm_count == 1 {
+            let the_only = self.warm[0];
             return (the_only, the_only, the_only);
         }
 
         // Reuse a single buffer across iterations to avoid REPEATS allocations.
-        let mut resampled = self.durations.clone();
-        let distr = rand::distr::Uniform::new(0, durations_count).expect("Must be OK");
+        let mut resampled = self.warm.clone();
+        let distr = rand::distr::Uniform::new(0, warm_count).expect("Must be OK");
 
         let mut means = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
             resampled
                 .iter_mut()
-                .for_each(|sample| *sample = self.durations[rng.sample(distr)]);
-            let mean =
-                resampled.iter().map(|d| d.as_secs_f64()).sum::<f64>() / durations_count as f64;
+                .for_each(|sample| *sample = self.warm[rng.sample(distr)]);
+            let mean = resampled.iter().map(|d| d.as_secs_f64()).sum::<f64>() / warm_count as f64;
             means.push(mean);
         }
         means.sort_by(f64::total_cmp);
@@ -134,5 +177,104 @@ impl PingStatRunning {
             Duration::from_secs_f64(median),
             Duration::from_secs_f64(p_95),
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use rand::{SeedableRng, rngs::StdRng};
+
+    use super::*;
+
+    fn warm(ms: u64) -> Probe {
+        Probe {
+            latency: Duration::from_millis(ms),
+            cold: false,
+        }
+    }
+
+    fn cold(ms: u64) -> Probe {
+        Probe {
+            latency: Duration::from_millis(ms),
+            cold: true,
+        }
+    }
+
+    fn rng() -> StdRng {
+        StdRng::seed_from_u64(1337)
+    }
+
+    #[test]
+    fn setup_only_computes_to_none() {
+        let mut stat = PingStatRunning::default();
+        stat.record_ping(cold(300));
+        stat.record_error();
+        assert!(stat.is_setup_only());
+        assert!(stat.compute(&mut rng()).is_none());
+    }
+
+    #[test]
+    fn no_samples_at_all_computes_to_none() {
+        let mut stat = PingStatRunning::default();
+        stat.record_error();
+        stat.record_error();
+        assert!(!stat.is_setup_only());
+        assert!(stat.compute(&mut rng()).is_none());
+    }
+
+    #[test]
+    fn setup_does_not_leak_into_statistics() {
+        let mut with_setup = PingStatRunning::default();
+        with_setup.record_ping(cold(900));
+        let mut without_setup = PingStatRunning::default();
+        for stat in [&mut with_setup, &mut without_setup] {
+            stat.record_ping(warm(10));
+            stat.record_ping(warm(20));
+            stat.record_ping(warm(30));
+        }
+        // Identical warm samples + identical rng seed → identical statistics,
+        // no matter how heavy the setup sample was.
+        let a = with_setup.compute(&mut rng()).unwrap();
+        let b = without_setup.compute(&mut rng()).unwrap();
+        assert_eq!(a.median(), b.median());
+        assert_eq!(a.low(), b.low());
+        assert_eq!(a.high(), b.high());
+        assert_eq!(a.setup(), Some(Duration::from_millis(900)));
+        assert_eq!(b.setup(), None);
+    }
+
+    #[test]
+    fn single_warm_sample_collapses_the_interval() {
+        let mut stat = PingStatRunning::default();
+        stat.record_ping(cold(500));
+        stat.record_ping(warm(42));
+        let computed = stat.compute(&mut rng()).unwrap();
+        let expected = Duration::from_millis(42);
+        assert_eq!(computed.low(), expected);
+        assert_eq!(computed.median(), expected);
+        assert_eq!(computed.high(), expected);
+    }
+
+    #[test]
+    fn first_cold_probe_wins() {
+        // A well-formed stream yields one cold probe; if a second ever
+        // arrives, the genuine (first) setup figure must be kept.
+        let mut stat = PingStatRunning::default();
+        stat.record_ping(cold(300));
+        stat.record_ping(cold(700));
+        stat.record_ping(warm(10));
+        let computed = stat.compute(&mut rng()).unwrap();
+        assert_eq!(computed.setup(), Some(Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn errors_are_counted_through() {
+        let mut stat = PingStatRunning::default();
+        stat.record_error();
+        stat.record_ping(cold(100));
+        stat.record_ping(warm(10));
+        stat.record_error();
+        assert_eq!(stat.errors(), 2);
+        assert_eq!(stat.compute(&mut rng()).unwrap().errors(), 2);
     }
 }

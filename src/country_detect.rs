@@ -38,16 +38,16 @@ const SURVEY_CONCURRENCY: usize = 16;
 /// precise one — precision is the main pipeline's job, on the ~50 mirrors that
 /// survive this screen.
 ///
-/// At [`SURVEY_INTERVAL`] a *nearby* mirror fits four probes in here. The
-/// first pays TCP connect and the TLS handshake; the rest reuse the pooled
-/// connection, and the median of four (index 2 of a sorted 4) discards that
-/// cold sample. Those are exactly the mirrors whose numbers decide anything.
+/// At [`SURVEY_INTERVAL`] a *nearby* mirror fits four probes in here: the
+/// cold one that pays TCP connect and the TLS handshake — set aside as the
+/// setup figure — and roughly three warm ones that reuse the pooled
+/// connection and form the median. Those are exactly the mirrors whose
+/// numbers decide anything. A distant mirror fits fewer, so its median rests
+/// on one or two warm samples; rough, but no longer inflated by the handshake
+/// the way it was when cold and warm samples were pooled.
 ///
-/// A distant mirror fits fewer, and at two its median *is* the cold handshake
-/// sample — `samples[len / 2]` at length 2 is index 1. That inflates far
-/// mirrors, which only pushes them further down a ranking they were losing
-/// anyway, so it is left alone. It is also why this must not be shortened to
-/// the point where near mirrors land in the same trap.
+/// Shortening the budget therefore costs coverage rather than accuracy: a
+/// mirror must land at least one warm sample or it is dropped as setup-only.
 const SURVEY_BUDGET: Duration = Duration::from_millis(500);
 
 /// Interval between probes against the same mirror (jittered ±10% inside
@@ -398,27 +398,46 @@ async fn survey(
                 resolve_bar.inc(1);
                 // A name that will not resolve costs one lookup here instead
                 // of a whole ping budget downstream.
-                resolved.then_some((country, url))
+                resolved.then_some((country, url, host))
             }
         })
         .buffer_unordered(resolver.lookup_concurrency())
         .filter_map(std::future::ready)
-        .map(|(country, url)| {
+        .map(|(country, url, host)| {
             let client = client.clone();
-            async move { (country, probe(&client, url).await) }
+            async move { (country, host, probe(&client, url).await) }
         })
         .buffer_unordered(SURVEY_CONCURRENCY);
     futures_util::pin_mut!(pings);
 
     let mut results = Vec::new();
+    let mut setup_only = 0usize;
     let mut leaders: Vec<(CountryCode, Duration)> = Vec::new();
-    while let Some((country, mut samples)) = pings.next().await {
+    while let Some((country, host, (setup, mut warm))) = pings.next().await {
         leaders_bar.inc(1);
-        if samples.is_empty() {
+        if warm.is_empty() {
+            // Same policy as the main pipeline: a mirror whose only answer
+            // was the cold probe is dropped, not judged by its handshake.
+            // Counted so the policy's cost stays visible.
+            if let Some(setup) = setup {
+                setup_only += 1;
+                tracing::debug!(
+                    "{} {host}: dropped as setup-only, setup {setup:.2?}",
+                    country.as_code()
+                );
+            }
             continue;
         }
-        samples.sort_unstable();
-        let median = samples[samples.len() / 2];
+        warm.sort_unstable();
+        let median = warm[warm.len() / 2];
+        // The per-mirror record behind a country verdict. Cheap to emit and
+        // the only way to tell a genuinely close mirror from a mislabelled or
+        // misbehaving one after the fact.
+        let setup = setup.map_or_else(|| "n/a".to_owned(), |s| format!("{s:.2?}"));
+        tracing::debug!(
+            "{} {host}: median {median:.2?} of {warm:.2?}, setup {setup}",
+            country.as_code()
+        );
         update_leaders(&mut leaders, country, median);
         leaders_bar.set_message(format_leaders(&leaders));
         results.push(Sample { country, median });
@@ -427,24 +446,33 @@ async fn survey(
     leaders_bar.finish_and_clear();
     drop(progress);
 
+    if setup_only > 0 {
+        tracing::info!("{setup_only} mirrors dropped as setup-only (only the cold probe answered).");
+    }
     Ok(results)
 }
 
-/// Probes one mirror for [`SURVEY_BUDGET`] and returns its raw latency samples.
+/// Probes one mirror for [`SURVEY_BUDGET`] and returns its connection-setup
+/// latency (the cold probe) plus the raw warm samples.
 ///
 /// The name is already in the resolver's cache by the time this runs, so the
-/// first probe pays connect and TLS but never DNS.
-async fn probe(client: &reqwest::Client, url: url::Url) -> Vec<Duration> {
+/// cold probe pays connect and TLS but never DNS.
+async fn probe(client: &reqwest::Client, url: url::Url) -> (Option<Duration>, Vec<Duration>) {
     let deadline = Instant::now() + SURVEY_BUDGET;
     let stream = crate::ping_test::ping_url(client, url, SURVEY_INTERVAL, deadline);
     futures_util::pin_mut!(stream);
-    let mut samples = Vec::new();
+    let mut setup = None;
+    let mut warm = Vec::new();
     while let Some(result) = stream.next().await {
-        if let Ok(d) = result {
-            samples.push(d);
+        if let Ok(probe) = result {
+            if probe.cold {
+                setup.get_or_insert(probe.latency);
+            } else {
+                warm.push(probe.latency);
+            }
         }
     }
-    samples
+    (setup, warm)
 }
 
 /// Maintains an in-place top-3 leaderboard keyed on best-seen median per
@@ -484,6 +512,7 @@ fn select_countries(mut samples: Vec<Sample>, opts: DetectOptions) -> Vec<Countr
     }
     let baseline = samples[baseline_window / 2].median;
     let cutoff = baseline.mul_f64(opts.threshold);
+    tracing::debug!("Baseline {baseline:.2?} over {baseline_window} mirrors, cutoff {cutoff:.2?}",);
 
     let mut picked: Vec<CountryCode> = Vec::with_capacity(opts.k_countries.get());
     for s in samples {

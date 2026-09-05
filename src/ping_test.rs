@@ -5,6 +5,25 @@ use futures_util::Stream;
 use rand::{Rng, RngExt};
 use reqwest::IntoUrl;
 
+/// One successful latency measurement out of [`ping_url`].
+#[derive(Debug, Clone, Copy)]
+pub struct Probe {
+    /// Time from sending the request to receiving the response headers.
+    pub latency: Duration,
+    /// `true` for the first probe on a stream that succeeds: with no pooled
+    /// connection to reuse, it pays TCP connect and the TLS handshake on top
+    /// of the request round-trip (and a DNS lookup too, unless the client's
+    /// resolver cache was warmed beforehand). Warm probes measure the bare
+    /// request over an established connection.
+    ///
+    /// This is an approximation — reqwest does not reveal whether a request
+    /// actually reused a connection. A server that sends `Connection: close`
+    /// makes every probe cold, and a keep-alive dropped mid-stream forces a
+    /// silent reconnect; both are reported as warm. Still strictly better
+    /// than treating every sample alike.
+    pub cold: bool,
+}
+
 /// Runs a HEAD request against the provided URL and measures the time until any
 /// response is received.
 async fn time_to_first_byte_once<T: IntoUrl>(
@@ -16,8 +35,8 @@ async fn time_to_first_byte_once<T: IntoUrl>(
     Ok(start.elapsed())
 }
 
-/// Repeatedly probes `url` with `HEAD` requests and yields the latency of
-/// each probe.
+/// Repeatedly probes `url` with `HEAD` requests and yields each probe's
+/// latency, tagged cold or warm — see [`Probe::cold`].
 ///
 /// The stream fires its first probe immediately and then waits `interval`
 /// (±10% jitter) between probes. Each probe is bounded by `until`, so a
@@ -32,39 +51,55 @@ pub fn ping_url<T: IntoUrl + Clone>(
     url: T,
     interval: Duration,
     until: Instant,
-) -> impl Stream<Item = Result<Duration, String>> {
+) -> impl Stream<Item = Result<Probe, String>> {
     // OS-seeded: we only use it for timing jitter, not anything reproducible.
     let mut rng: rand::rngs::StdRng = rand::make_rng();
-    futures_util::stream::unfold((true, Instant::now()), move |(is_first, last_request)| {
-        let url = url.clone();
-        let interval = jitter_duration(interval, 0.1, &mut rng);
-        // `reqwest::Client` is internally `Arc`-based, so cloning is a cheap
-        // refcount bump — cheaper than threading a shared borrow through the
-        // async state machine.
-        let client = client.clone();
-        async move {
-            if !is_first {
-                let next_ping = last_request + interval;
-                if next_ping >= until {
-                    return None;
+    futures_util::stream::unfold(
+        (true, false, Instant::now()),
+        move |(is_first, had_success, last_request)| {
+            let url = url.clone();
+            let interval = jitter_duration(interval, 0.1, &mut rng);
+            // `reqwest::Client` is internally `Arc`-based, so cloning is a cheap
+            // refcount bump — cheaper than threading a shared borrow through the
+            // async state machine.
+            let client = client.clone();
+            async move {
+                if !is_first {
+                    let next_ping = last_request + interval;
+                    if next_ping >= until {
+                        return None;
+                    }
+                    tokio::time::sleep_until(next_ping.into()).await;
                 }
-                tokio::time::sleep_until(next_ping.into()).await;
+
+                // `timeout_at(until, ...)` caps the request at the phase
+                // deadline: a hung connection gets cancelled instead of
+                // bleeding into the next phase.
+                let result = tokio::time::timeout_at(
+                    tokio::time::Instant::from(until) + Duration::from_millis(500),
+                    time_to_first_byte_once(&client, url),
+                )
+                .await
+                .map_err(|e| DisplayErrorChain::new(e).to_string())
+                .and_then(|result| result.map_err(|e| DisplayErrorChain::new(e).to_string()));
+
+                // A failed request leaves no pooled connection behind, so the
+                // next success is still the cold one.
+                let (result, had_success) = match result {
+                    Ok(latency) => (
+                        Ok(Probe {
+                            latency,
+                            cold: !had_success,
+                        }),
+                        true,
+                    ),
+                    Err(e) => (Err(e), had_success),
+                };
+
+                Some((result, (false, had_success, Instant::now())))
             }
-
-            // `timeout_at(until, ...)` caps the request at the phase
-            // deadline: a hung connection gets cancelled instead of
-            // bleeding into the next phase.
-            let result = tokio::time::timeout_at(
-                tokio::time::Instant::from(until) + Duration::from_millis(500),
-                time_to_first_byte_once(&client, url),
-            )
-            .await
-            .map_err(|e| DisplayErrorChain::new(e).to_string())
-            .and_then(|result| result.map_err(|e| DisplayErrorChain::new(e).to_string()));
-
-            Some((result, (false, Instant::now())))
-        }
-    })
+        },
+    )
 }
 
 /// Applies a random jitter to a `Duration`.

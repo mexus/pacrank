@@ -17,7 +17,7 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use display_error_chain::DisplayErrorChain;
@@ -154,9 +154,13 @@ impl Inner {
             return Ok(hit.clone());
         }
 
+        let started = Instant::now();
         let addrs = tokio::time::timeout(LOOKUP_TIMEOUT, self.lookup(host))
             .await
             .map_err(|_| format!("No answer for {host} within {LOOKUP_TIMEOUT:?}"))??;
+        // Warming keeps DNS out of every ping sample, which makes this the
+        // only place its latency is visible at all.
+        tracing::debug!("Resolved {host} in {:.2?}", started.elapsed());
 
         self.cache
             .lock()
