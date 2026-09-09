@@ -256,33 +256,30 @@ pub fn ping_url(
                     cap = cap.min(tokio::time::Instant::now() + timeout.current());
                 }
 
-                let result = match tokio::time::timeout_at(
-                    cap,
-                    time_to_first_byte_once(&client, url),
-                )
-                .await
-                {
-                    Ok(Ok(latency)) => {
-                        if let Some(timeout) = &setup_timeout {
-                            timeout.observe(latency);
+                let result =
+                    match tokio::time::timeout_at(cap, time_to_first_byte_once(&client, url)).await
+                    {
+                        Ok(Ok(latency)) => {
+                            if let Some(timeout) = &setup_timeout {
+                                timeout.observe(latency);
+                            }
+                            Ok(Probe {
+                                latency,
+                                cold: is_cold,
+                            })
                         }
-                        Ok(Probe {
-                            latency,
-                            cold: is_cold,
-                        })
-                    }
-                    // A request *error* says nothing about duration, so it
-                    // does not feed the timeout. It also leaves no pooled
-                    // connection behind, so the next success is still the
-                    // cold one.
-                    Ok(Err(e)) => Err(DisplayErrorChain::new(e).to_string()),
-                    Err(elapsed) => {
-                        if let Some(timeout) = &setup_timeout {
-                            timeout.observe_timeout();
+                        // A request *error* says nothing about duration, so it
+                        // does not feed the timeout. It also leaves no pooled
+                        // connection behind, so the next success is still the
+                        // cold one.
+                        Ok(Err(e)) => Err(DisplayErrorChain::new(e).to_string()),
+                        Err(elapsed) => {
+                            if let Some(timeout) = &setup_timeout {
+                                timeout.observe_timeout();
+                            }
+                            Err(DisplayErrorChain::new(elapsed).to_string())
                         }
-                        Err(DisplayErrorChain::new(elapsed).to_string())
-                    }
-                };
+                    };
 
                 let had_success = had_success || result.is_ok();
                 Some((result, (false, had_success, Instant::now())))
@@ -407,9 +404,8 @@ mod test {
                         match sock.read(&mut buf).await {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {
-                                let response = format!(
-                                    "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\n\r\n"
-                                );
+                                let response =
+                                    format!("HTTP/1.1 {status_line}\r\ncontent-length: 0\r\n\r\n");
                                 if sock.write_all(response.as_bytes()).await.is_err() {
                                     break;
                                 }

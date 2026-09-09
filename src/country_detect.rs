@@ -505,7 +505,9 @@ async fn survey(
     drop(progress);
 
     if setup_only > 0 {
-        tracing::info!("{setup_only} mirrors dropped as setup-only (only the cold probe answered).");
+        tracing::info!(
+            "{setup_only} mirrors dropped as setup-only (only the cold probe answered)."
+        );
     }
     tracing::debug!(
         "Adaptive cold-probe cap settled at {:.2?} after cutting {} probes.",
