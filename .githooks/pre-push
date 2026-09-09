@@ -1,0 +1,28 @@
+#!/bin/sh
+#
+# Reject a push whose tree isn't rustfmt-clean, so the CI fmt job never has
+# to be the one to tell you. Checks the working tree rather than the commits
+# being pushed — that's what `cargo fmt` can see, and the two only diverge
+# when you have uncommitted changes.
+#
+# Enable it (once per clone):
+#
+#     git config core.hooksPath .githooks
+#
+# Bypass it for a single push with `git push --no-verify`.
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: cargo not found, skipping the fmt check." >&2
+    exit 0
+fi
+
+if cargo fmt --all -- --check >/dev/null 2>&1; then
+    exit 0
+fi
+
+echo >&2
+echo "pre-push: rustfmt would reformat the following:" >&2
+cargo fmt --all -- --check >&2
+echo >&2
+echo "Fix with 'cargo fmt --all', or push anyway with --no-verify." >&2
+exit 1

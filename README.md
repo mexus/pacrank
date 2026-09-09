@@ -156,6 +156,21 @@ on the way in to break any hypothetical escalation loop.
 
 Already root? Step 1 is skipped and execution jumps straight to step 2.
 
+## Development
+
+CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D
+warnings` and `cargo test --all-targets`, plus a build against the MSRV in
+`Cargo.toml`. The fmt check is also available as a pre-push hook, so a
+formatting slip fails on your machine in a second rather than in a red build
+after the tag is already pushed. Enable it once per clone:
+
+```console
+$ git config core.hooksPath .githooks
+```
+
+It rejects a push whose working tree isn't rustfmt-clean and prints the
+offending diff. `git push --no-verify` bypasses it for one push.
+
 ## License
 
 Dual-licensed under either of
