@@ -100,7 +100,8 @@ fn main() -> Result<(), snafu::Whatever> {
     // in the worker, which receives the resolved list via argv. Doing it
     // here guarantees the cache lands under the invoking user's HOME, not
     // root's, and that we don't survey twice (parent + worker).
-    if country.is_empty() && !worker {
+    let auto_detected = country.is_empty() && !worker;
+    if auto_detected {
         country = country_detect::resolve(DetectOptions {
             baseline_n: detect_baseline_n,
             threshold: detect_threshold,
@@ -112,6 +113,9 @@ fn main() -> Result<(), snafu::Whatever> {
         })
         .whatever_context("Country auto-detection failed")?;
     }
+    // `-c` accepts the same code twice, so normalize before anything
+    // downstream filters or logs the list.
+    CountryCode::dedup(&mut country);
     snafu::ensure_whatever!(
         !country.is_empty(),
         "No countries available — pass --country/-c explicitly."
@@ -129,7 +133,10 @@ fn main() -> Result<(), snafu::Whatever> {
     } else if worker {
         run_worker(dl_k, ping_k, &country)
     } else {
-        run_privileged(&country)
+        // Only a list we resolved ourselves needs injecting into the child's
+        // argv; an explicit `-c` is already part of `env::args()`.
+        let injected: &[CountryCode] = if auto_detected { &country } else { &[] };
+        run_privileged(&forwarded_args(injected))
     }
 }
 
@@ -146,13 +153,16 @@ fn init_tracing() {
 
 /// Builds the argv to forward to a child process (sudo re-exec or
 /// `--worker` subprocess) — our own arguments minus `argv[0]`, with each
-/// resolved country appended as `-c <CODE>`.
+/// country in `injected` appended as `-c <CODE>`.
 ///
-/// Re-injecting the resolved countries here means the child sees a fully
-/// specified `--country` list and never re-runs auto-detection itself.
-fn forwarded_args(countries: &[CountryCode]) -> Vec<String> {
+/// Injecting the countries here means the child sees a fully specified
+/// `--country` list and never re-runs auto-detection itself. Only the ones
+/// *this* process auto-detected belong in `injected`: an explicit `-c` is
+/// already part of `env::args()`, and appending it again would hand the child
+/// a doubled list, one extra copy per hop (parent → sudo child → worker).
+fn forwarded_args(injected: &[CountryCode]) -> Vec<String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    for cc in countries {
+    for cc in injected {
         args.push("-c".to_string());
         args.push(cc.as_code().to_string());
     }
@@ -203,9 +213,9 @@ fn run_worker(
 
 /// Privileged parent entry point: make sure we're root, spawn an unprivileged
 /// worker, and atomically replace `/etc/pacman.d/mirrorlist` with the result.
-fn run_privileged(countries: &[CountryCode]) -> Result<(), snafu::Whatever> {
-    escalate_if_needed(countries)?;
-    let mirrors = spawn_worker_and_read_mirrors(countries)?;
+fn run_privileged(child_args: &[String]) -> Result<(), snafu::Whatever> {
+    escalate_if_needed(child_args)?;
+    let mirrors = spawn_worker_and_read_mirrors(child_args)?;
     write_mirrorlist(&mirrors)?;
     Ok(())
 }
@@ -217,7 +227,7 @@ fn run_privileged(countries: &[CountryCode]) -> Result<(), snafu::Whatever> {
 /// If escalation happens, this function does not return — it exits the
 /// current process with the sudo child's exit code. On the already-root path
 /// it simply returns `Ok(())`.
-fn escalate_if_needed(countries: &[CountryCode]) -> Result<(), snafu::Whatever> {
+fn escalate_if_needed(child_args: &[String]) -> Result<(), snafu::Whatever> {
     if nix::unistd::Uid::effective().is_root() {
         return Ok(());
     }
@@ -240,7 +250,7 @@ fn escalate_if_needed(countries: &[CountryCode]) -> Result<(), snafu::Whatever> 
         // privilege jump; sudo's default env_reset would otherwise drop it.
         .arg("--preserve-env=RUST_LOG,PACRANK_ESCALATED")
         .arg(current_exe)
-        .args(forwarded_args(countries))
+        .args(child_args)
         .status()
         .whatever_context("Failed to execute sudo; install sudo or re-run as root")?;
     std::process::exit(status.code().unwrap_or(1));
@@ -248,11 +258,11 @@ fn escalate_if_needed(countries: &[CountryCode]) -> Result<(), snafu::Whatever> 
 
 /// Spawns this binary with `--worker`, collects its stdout, and decodes the
 /// JSON-encoded list of winning mirror URLs.
-fn spawn_worker_and_read_mirrors(countries: &[CountryCode]) -> Result<Vec<Url>, snafu::Whatever> {
+fn spawn_worker_and_read_mirrors(child_args: &[String]) -> Result<Vec<Url>, snafu::Whatever> {
     let current_exe =
         std::env::current_exe().whatever_context("Can't get current executable path")?;
     let child = Command::new(current_exe)
-        .args(forwarded_args(countries))
+        .args(child_args)
         .arg("--worker")
         .stdout(Stdio::piped())
         .spawn()

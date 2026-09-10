@@ -1,5 +1,7 @@
 //! Mirror-related utilities.
 
+use std::collections::HashSet;
+
 /// Version-aware mirrors list.
 #[derive(Debug, Clone)]
 pub enum Mirrors {
@@ -341,6 +343,17 @@ countries!(CountryCode:
     ZA => "South Africa",
 );
 
+impl CountryCode {
+    /// Removes repeated country codes, keeping the first occurrence of each.
+    ///
+    /// The order carries meaning — auto-detection yields the closest country
+    /// first — so this deliberately isn't a `sort` + `dedup`.
+    pub fn dedup(countries: &mut Vec<Self>) {
+        let mut seen = HashSet::with_capacity(countries.len());
+        countries.retain(|country| seen.insert(*country));
+    }
+}
+
 /// Known protocols.
 ///
 /// Upstream derives this from the mirror URL's scheme and stores it in a
@@ -544,5 +557,29 @@ pub(crate) mod test {
             let code_parsed = code_fmt.parse().expect("Must be ok");
             assert_eq!(code, code_parsed, "code_fmt = {code_fmt}");
         }
+    }
+
+    #[test]
+    fn dedup_keeps_the_first_occurrence() {
+        let mut countries = vec![
+            CountryCode::RU,
+            CountryCode::CN,
+            CountryCode::RU,
+            CountryCode::CN,
+            CountryCode::DE,
+        ];
+        CountryCode::dedup(&mut countries);
+        assert_eq!(
+            countries,
+            vec![CountryCode::RU, CountryCode::CN, CountryCode::DE]
+        );
+    }
+
+    #[test]
+    fn dedup_leaves_a_unique_list_alone() {
+        let mut countries = vec![CountryCode::DE, CountryCode::NL, CountryCode::AT];
+        let expected = countries.clone();
+        CountryCode::dedup(&mut countries);
+        assert_eq!(countries, expected);
     }
 }

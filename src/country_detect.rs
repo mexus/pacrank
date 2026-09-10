@@ -721,7 +721,13 @@ fn cache_path() -> Option<PathBuf> {
 fn load_cache(path: &std::path::Path) -> Option<CacheEntry> {
     let bytes = fs::read(path).ok()?;
     match serde_json::from_slice::<CacheEntry>(&bytes) {
-        Ok(entry) => Some(entry),
+        Ok(mut entry) => {
+            // The file is user-writable and may have been produced by an
+            // older version, so normalize on the way in — otherwise the
+            // duplicates leak into both the log line and the pipeline.
+            CountryCode::dedup(&mut entry.countries);
+            Some(entry)
+        }
         Err(e) => {
             tracing::warn!(
                 "Failed to parse country cache at {}: {} — ignoring.",
@@ -973,6 +979,31 @@ mod test {
         assert_eq!(loaded.ip_prefix, entry.ip_prefix);
         assert_eq!(loaded.detected_at, entry.detected_at);
         assert_eq!(loaded.countries, entry.countries);
+    }
+
+    /// A cache file written by an older version can carry repeats; loading
+    /// must normalize them away.
+    #[test]
+    fn cache_load_dedupes_countries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("countries.json");
+        let entry = CacheEntry {
+            ip_prefix: "203.0.0.0/16".to_string(),
+            detected_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+            countries: vec![
+                CountryCode::RU,
+                CountryCode::CN,
+                CountryCode::RU,
+                CountryCode::CN,
+            ],
+        };
+        save_cache(&path, &entry).unwrap();
+        let loaded = load_cache(&path).unwrap();
+        assert_eq!(
+            loaded.countries,
+            vec![CountryCode::RU, CountryCode::CN],
+            "The load path must drop the duplicates"
+        );
     }
 
     #[test]
