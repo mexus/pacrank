@@ -273,8 +273,8 @@ async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectEr
         && fresh_enough(entry)
     {
         tracing::info!(
-            "Using cached countries ({}) — IP prefix matches and cache is fresh.",
-            format_countries(&entry.countries)
+            "Using cached countries: {} — IP prefix matches and cache is fresh.",
+            CountryCode::format_list(&entry.countries)
         );
         return Ok(entry.countries.clone());
     }
@@ -311,7 +311,7 @@ async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectEr
                 tracing::warn!(
                     "Country detection failed ({}); falling back to stale cache: {}",
                     DisplayErrorChain::new(&detect_err),
-                    format_countries(&entry.countries),
+                    CountryCode::format_list(&entry.countries),
                 );
                 Ok(entry.countries)
             }
@@ -345,7 +345,7 @@ async fn detect(
     tracing::info!(
         "Detected {} closest countries: {}",
         countries.len(),
-        format_countries(&countries)
+        CountryCode::format_list(&countries)
     );
     Ok(countries)
 }
@@ -583,6 +583,11 @@ fn update_leaders(
     leaders.truncate(3);
 }
 
+/// Renders the live leaderboard for the survey's progress bar.
+///
+/// Short codes here, unlike everywhere else: the bar is redrawn in place and
+/// indicatif truncates it to the terminal width, which three spelled-out
+/// names (`United Arab Emirates 123.45ms · …`) would blow past.
 fn format_leaders(leaders: &[(CountryCode, Duration)]) -> String {
     leaders
         .iter()
@@ -615,14 +620,6 @@ fn select_countries(mut samples: Vec<Sample>, opts: DetectOptions) -> Vec<Countr
         }
     }
     picked
-}
-
-fn format_countries(countries: &[CountryCode]) -> String {
-    countries
-        .iter()
-        .map(CountryCode::as_code)
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 // ---------- Public-IP fetch ----------

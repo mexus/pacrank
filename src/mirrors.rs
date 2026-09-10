@@ -352,6 +352,22 @@ impl CountryCode {
         let mut seen = HashSet::with_capacity(countries.len());
         countries.retain(|country| seen.insert(*country));
     }
+
+    /// Renders a list of countries for log output as `Name (CODE), …`.
+    ///
+    /// The code is worth the extra width: it's what the reader would type
+    /// back into `-c` to pin the result. `Unknown` has no code to show, so it
+    /// renders as its name alone.
+    pub fn format_list(countries: &[Self]) -> String {
+        countries
+            .iter()
+            .map(|country| match country {
+                Self::Unknown => country.full_name().to_string(),
+                _ => format!("{} ({})", country.full_name(), country.as_code()),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 /// Known protocols.
@@ -572,6 +588,20 @@ pub(crate) mod test {
         assert_eq!(
             countries,
             vec![CountryCode::RU, CountryCode::CN, CountryCode::DE]
+        );
+    }
+
+    #[test]
+    fn format_list_spells_out_the_names() {
+        assert_eq!(
+            CountryCode::format_list(&[CountryCode::RU, CountryCode::CN]),
+            "Russia (RU), China (CN)"
+        );
+        assert_eq!(CountryCode::format_list(&[]), "");
+        // The codeless variant must not render as `[unknown] ()`.
+        assert_eq!(
+            CountryCode::format_list(&[CountryCode::Unknown]),
+            "[unknown]"
         );
     }
 

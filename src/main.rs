@@ -520,18 +520,9 @@ async fn fetch_and_filter_mirrors(
     tracing::info!(
         "Discovered {} mirrors for {}",
         kept.len(),
-        format_countries(countries),
+        CountryCode::format_list(countries),
     );
     Ok(kept)
-}
-
-/// Renders a slice of country codes as a comma-separated list for log output.
-fn format_countries(countries: &[CountryCode]) -> String {
-    countries
-        .iter()
-        .map(CountryCode::as_code)
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Phase 1b: resolves every mirror's hostname into the shared resolver cache
