@@ -39,42 +39,14 @@ impl<'de> serde::Deserialize<'de> for Mirrors {
     }
 }
 
-impl serde::Serialize for Mirrors {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        #[derive(serde::Serialize)]
-        struct WithVersion<'a> {
-            #[serde(flatten)]
-            inner: &'a MirrorsV3,
-            version: u32,
-        }
-
-        match self {
-            Mirrors::V3(mirrors_v3) => serde::Serialize::serialize(
-                &WithVersion {
-                    inner: mirrors_v3,
-                    version: 3,
-                },
-                serializer,
-            ),
-        }
-    }
-}
-
 /// Archlinux mirrors info.
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Deserialize, Clone)]
 pub struct MirrorsV3 {
     /// The actual list of mirrors.
     ///
     /// Deserialized leniently: see `lenient_mirrors`.
     #[serde(deserialize_with = "lenient_mirrors")]
     pub urls: Vec<Mirror>,
-
-    /// Last check time.
-    #[serde(with = "time::serde::iso8601")]
-    pub last_check: time::OffsetDateTime,
 }
 
 /// Deserializes the mirror list, dropping entries that fail to parse instead
@@ -109,7 +81,7 @@ where
 }
 
 /// Archlinux mirror info.
-#[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
+#[derive(Debug, serde::Deserialize, Clone)]
 pub struct Mirror {
     /// Mirror URL.
     pub url: url::Url,
@@ -128,59 +100,8 @@ pub struct Mirror {
     pub delay: Option<i64>,
 
     /// Last sync time.
-    #[serde(with = "serde_maybe_time")]
+    #[serde(with = "time::serde::iso8601::option")]
     pub last_sync: Option<time::OffsetDateTime>,
-}
-
-/// Serde helpers for `Option<OffsetDateTime>` fields encoded as ISO-8601.
-///
-/// The `time` crate's built-in `time::serde::iso8601` only handles the
-/// non-optional case; this module wraps it to also accept `null`.
-pub(crate) mod serde_maybe_time {
-    use serde::{Deserializer, Serializer};
-    use time::OffsetDateTime;
-
-    /// Serializes `Some(datetime)` as an ISO-8601 string and `None` as `null`.
-    pub fn serialize<S>(datetime: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        if let Some(datetime) = datetime {
-            time::serde::iso8601::serialize(datetime, serializer)
-        } else {
-            serializer.serialize_none()
-        }
-    }
-
-    /// Deserializes `null` as `None` and any ISO-8601 string as `Some(dt)`.
-    pub fn deserialize<'a, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
-    where
-        D: Deserializer<'a>,
-    {
-        struct MaybeVisitor;
-        impl<'de> serde::de::Visitor<'de> for MaybeVisitor {
-            type Value = Option<OffsetDateTime>;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("null or iso8601 date time string")
-            }
-
-            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                time::serde::iso8601::deserialize(deserializer).map(Some)
-            }
-
-            fn visit_none<E>(self) -> Result<Self::Value, E>
-            where
-                E: serde::de::Error,
-            {
-                Ok(None)
-            }
-        }
-        deserializer.deserialize_option(MaybeVisitor)
-    }
 }
 
 /// Defines a country-code enum with `as_code`, `full_name`, `all`, `FromStr`
@@ -375,7 +296,7 @@ impl CountryCode {
 /// Upstream derives this from the mirror URL's scheme and stores it in a
 /// lookup table an admin can extend, so the set isn't closed; unrecognized
 /// values deserialize to [`Protocol::Unknown`] rather than failing.
-#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, serde::Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     /// HTTP protocol.
