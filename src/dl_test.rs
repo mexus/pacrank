@@ -2,41 +2,25 @@ use std::time::{Duration, Instant};
 
 use reqwest::IntoUrl;
 
-/// Callback invoked after every chunk that [`download`] reads.
-///
-/// `bytes` is the running total of bytes received so far. `total` is the
-/// value of the response's `Content-Length` header when known, or `None`
-/// (e.g. for chunked-transfer responses).
-pub trait ProgressCallback {
-    /// Reports the current byte count to the callback.
-    fn progress(&mut self, bytes: u64, total: Option<u64>);
-}
-
-impl<F> ProgressCallback for F
-where
-    F: FnMut(u64, Option<u64>),
-{
-    fn progress(&mut self, bytes: u64, total: Option<u64>) {
-        (self)(bytes, total)
-    }
-}
-
 /// Downloads `url` and reports throughput as `(bytes_received, elapsed)`.
 ///
-/// Streams the response body, invoking `callback` after each chunk. Stops as
-/// soon as `time_limit` has elapsed — the purpose is to measure throughput
-/// over a bounded window, not to fetch the whole file. The returned
-/// `elapsed` is measured after the last chunk, so it is always a little
-/// larger than `time_limit`.
-pub async fn download<U, C>(
+/// Streams the response body, invoking `callback(bytes, total)` after each
+/// chunk — `bytes` is the running total received so far, `total` the
+/// response's `Content-Length` when known, or `None` (e.g. for
+/// chunked-transfer responses; a 0 header means "unknown" rather than
+/// "empty" and is treated the same). Stops as soon as `time_limit` has
+/// elapsed — the purpose is to measure throughput over a bounded window,
+/// not to fetch the whole file. The returned `elapsed` is measured after
+/// the last chunk, so it is always a little larger than `time_limit`.
+pub async fn download<U, F>(
     client: &reqwest::Client,
     url: U,
-    mut callback: C,
+    mut callback: F,
     time_limit: Duration,
 ) -> reqwest::Result<(u64, Duration)>
 where
     U: IntoUrl,
-    C: ProgressCallback,
+    F: FnMut(u64, Option<u64>),
 {
     let mut response = client
         .get(url)
@@ -51,7 +35,7 @@ where
     let start = Instant::now();
     while let Some(chunk) = response.chunk().await? {
         downloaded += chunk.len() as u64;
-        callback.progress(downloaded, maybe_length);
+        callback(downloaded, maybe_length);
         if start.elapsed() >= time_limit {
             break;
         }
