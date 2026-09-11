@@ -6,9 +6,9 @@ use crate::ping_test::Probe;
 
 /// Accumulates raw latency samples during the ping phase.
 ///
-/// Call [`record_ping`](Self::record_ping) for each successful probe and
-/// [`record_error`](Self::record_error) for failures; then turn the accumulator
-/// into a [`PingStatComputed`] summary via [`compute`](Self::compute).
+/// Call [`record_ping`](Self::record_ping) for each successful probe; then
+/// turn the accumulator into a [`PingStatComputed`] summary via
+/// [`compute`](Self::compute).
 ///
 /// Cold and warm probes (see [`Probe::cold`]) land in separate buckets: the
 /// cold one becomes the mirror's *setup* figure, and only warm samples feed
@@ -20,7 +20,6 @@ use crate::ping_test::Probe;
 pub struct PingStatRunning {
     warm: Vec<Duration>,
     setup: Option<Duration>,
-    errors: usize,
 }
 
 /// Summary statistics derived from a set of [`PingStatRunning`] samples.
@@ -34,7 +33,6 @@ pub struct PingStatComputed {
     high: Duration,
     median: Duration,
     setup: Option<Duration>,
-    errors: usize,
 }
 
 impl PingStatComputed {
@@ -63,11 +61,6 @@ impl PingStatComputed {
     pub fn setup(&self) -> Option<Duration> {
         self.setup
     }
-
-    /// Number of probes that failed entirely (no duration recorded).
-    pub fn errors(&self) -> usize {
-        self.errors
-    }
 }
 
 impl PingStatRunning {
@@ -82,16 +75,6 @@ impl PingStatRunning {
         } else {
             self.warm.push(probe.latency);
         }
-    }
-
-    /// Records one failed probe (e.g. connection error, timeout).
-    pub fn record_error(&mut self) {
-        self.errors += 1;
-    }
-
-    /// Number of failed probes recorded so far.
-    pub fn errors(&self) -> usize {
-        self.errors
     }
 
     /// Latency of the cold probe recorded so far, if any — see
@@ -124,7 +107,6 @@ impl PingStatRunning {
             high,
             median,
             setup: self.setup,
-            errors: self.errors,
         })
     }
 
@@ -208,16 +190,13 @@ mod test {
     fn setup_only_computes_to_none() {
         let mut stat = PingStatRunning::default();
         stat.record_ping(cold(300));
-        stat.record_error();
         assert!(stat.is_setup_only());
         assert!(stat.compute(&mut rng()).is_none());
     }
 
     #[test]
     fn no_samples_at_all_computes_to_none() {
-        let mut stat = PingStatRunning::default();
-        stat.record_error();
-        stat.record_error();
+        let stat = PingStatRunning::default();
         assert!(!stat.is_setup_only());
         assert!(stat.compute(&mut rng()).is_none());
     }
@@ -265,16 +244,5 @@ mod test {
         stat.record_ping(warm(10));
         let computed = stat.compute(&mut rng()).unwrap();
         assert_eq!(computed.setup(), Some(Duration::from_millis(300)));
-    }
-
-    #[test]
-    fn errors_are_counted_through() {
-        let mut stat = PingStatRunning::default();
-        stat.record_error();
-        stat.record_ping(cold(100));
-        stat.record_ping(warm(10));
-        stat.record_error();
-        assert_eq!(stat.errors(), 2);
-        assert_eq!(stat.compute(&mut rng()).unwrap().errors(), 2);
     }
 }

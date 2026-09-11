@@ -133,8 +133,7 @@ struct IpEndpoint {
     parser: fn(&str) -> Option<IpAddr>,
 }
 
-/// Tunables for [`resolve`]. All fields have sensible defaults via
-/// [`Self::default`].
+/// Tunables for [`resolve`].
 #[derive(Debug, Clone, Copy)]
 pub struct DetectOptions {
     /// Number of fastest-pinged mirrors whose median latency forms the
@@ -151,18 +150,6 @@ pub struct DetectOptions {
     /// Decoupled from [`Self::read_cache`] so `--dry-run` can still read the
     /// cache (mirroring a real run's fast path) without leaving side effects.
     pub write_cache: bool,
-}
-
-impl Default for DetectOptions {
-    fn default() -> Self {
-        Self {
-            baseline_n: NonZeroUsize::new(5).expect("5 != 0"),
-            threshold: 1.5,
-            k_countries: NonZeroUsize::new(3).expect("3 != 0"),
-            read_cache: true,
-            write_cache: true,
-        }
-    }
 }
 
 /// Errors that abort country detection.

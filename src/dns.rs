@@ -296,6 +296,8 @@ impl SurveyResolver {
     }
 }
 
+// `Default` is required by clippy::new_without_default for `pub fn new`;
+// it just delegates.
 impl Default for SurveyResolver {
     fn default() -> Self {
         Self::new()

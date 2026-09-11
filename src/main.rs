@@ -616,7 +616,6 @@ async fn latency_phase(
                 mirror_data.ping_stat.record_ping(probe);
             }
             Err(err) => {
-                mirror_data.ping_stat.record_error();
                 tracing::debug!("{}: {err:?}", mirror_data.mirror.url);
             }
         }

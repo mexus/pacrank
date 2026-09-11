@@ -26,7 +26,7 @@ pub mod ping_stat;
 /// cap for cold probes.
 pub mod ping_test;
 
-pub use mirrors::{CountryCode, Mirror, Mirrors, MirrorsV3, Protocol};
+pub use mirrors::{CountryCode, Mirror, Mirrors};
 
 /// HTTP `User-Agent` header sent by every outgoing request.
 ///
