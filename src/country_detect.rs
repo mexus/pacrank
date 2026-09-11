@@ -65,9 +65,9 @@ const SURVEY_INTERVAL: Duration = Duration::from_millis(150);
 /// Starting (and maximum) value of the adaptive cold-probe cap.
 ///
 /// Matches the worst case a request could take before the cap existed —
-/// [`SURVEY_BUDGET`] plus the 500ms per-request grace inside `ping_url` — so
-/// until the first setup samples arrive, behavior is identical to the fixed
-/// cap.
+/// [`SURVEY_BUDGET`] plus `ping_test::DEADLINE_GRACE` (the per-request
+/// grace inside `ping_url`) — so until the first setup samples arrive,
+/// behavior is identical to the fixed cap.
 const SETUP_TIMEOUT_INITIAL: Duration = Duration::from_secs(1);
 
 /// The tightest the adaptive cold-probe cap may get.

@@ -18,6 +18,15 @@ use reqwest::IntoUrl;
 /// exactly what the interval exists to prevent.
 const JITTER_FRACTION: f64 = 0.1;
 
+/// Grace added to a phase deadline when capping a probe with `timeout_at`.
+///
+/// A request launched just before the deadline is allowed this much time to
+/// settle past it, so a hung connection is cancelled by us instead of
+/// bleeding into whatever phase follows. The country survey's adaptive
+/// cold-probe cap sizes itself against this same grace
+/// (`SETUP_TIMEOUT_INITIAL` in `country_detect`).
+pub(crate) const DEADLINE_GRACE: Duration = Duration::from_millis(500);
+
 /// A self-tuning cap for cold probes, shared by every stream of one
 /// measurement run.
 ///
@@ -258,7 +267,7 @@ pub fn ping_url(
                 // grace): a hung connection gets cancelled instead of
                 // bleeding into the next phase. The cold request may be
                 // capped tighter still by the adaptive setup timeout.
-                let mut cap = tokio::time::Instant::from(until) + Duration::from_millis(500);
+                let mut cap = tokio::time::Instant::from(until) + DEADLINE_GRACE;
                 if let Some(timeout) = &setup_timeout {
                     cap = cap.min(tokio::time::Instant::now() + timeout.current());
                 }
