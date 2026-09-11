@@ -2,9 +2,9 @@
 //!
 //! Picking the largest package gives the throughput test a long-lived chunk
 //! to measure against — small packages are dominated by connection setup
-//! noise. We fetch `core/os/x86_64/core.db` (a compressed tar of per-package
-//! `desc` files), walk the archive, and return the URL of the package with
-//! the largest `%CSIZE%`.
+//! noise. We fetch the `core` repository database (a compressed tar of
+//! per-package `desc` files) at `CORE_REPO_DIR`, walk the archive, and
+//! return the URL of the package with the largest `%CSIZE%`.
 
 use std::{io::Read, time::Duration};
 
@@ -12,6 +12,10 @@ use camino::Utf8Path;
 use display_error_chain::DisplayErrorChain;
 use snafu::{OptionExt, ResultExt, Snafu};
 use url::Url;
+
+/// Path of the `core` repository directory on a mirror, relative to the
+/// mirror's base URL.
+const CORE_REPO_DIR: &str = "core/os/x86_64/";
 
 /// Errors reported by [`discover`].
 #[derive(Debug, Snafu)]
@@ -59,15 +63,16 @@ pub enum DiscoveryError {
 
 /// Returns the URL of the largest package in the mirror's `core` repository.
 ///
-/// Downloads `core/os/x86_64/core.db` from the given mirror, scans every
-/// `desc` entry for its `%CSIZE%`, and returns the URL of the winner.
+/// Downloads the repository database (`CORE_REPO_DIR` + `core.db`) from
+/// the given mirror, scans every `desc` entry for its `%CSIZE%`, and returns
+/// the URL of the winner.
 pub async fn discover(
     client: &reqwest::Client,
     repo_url: &Url,
     time_limit: Duration,
 ) -> Result<Url, DiscoveryError> {
     let core_db_url = repo_url
-        .join("core/os/x86_64/core.db")
+        .join(&format!("{CORE_REPO_DIR}core.db"))
         .context(InvalidCoreUrlSnafu)?;
     let response = client
         .get(core_db_url.as_str())
@@ -136,7 +141,7 @@ pub async fn discover(
     );
 
     repo_url
-        .join("core/os/x86_64/")
+        .join(CORE_REPO_DIR)
         .expect("Shouldn't fail")
         .join(&largest_entry.file_name)
         .context(InvalidLargestEntryUrlSnafu {
