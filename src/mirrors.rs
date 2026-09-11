@@ -321,6 +321,13 @@ impl Mirror {
         matches!(self.protocol, Protocol::Http | Protocol::Https)
     }
 
+    /// The mirror's `lastsync` URL — cheap to HEAD and present on every
+    /// mirror, which makes it the probe target for both the survey and the
+    /// latency phase.
+    pub fn lastsync_url(&self) -> Option<url::Url> {
+        self.url.join("lastsync").ok()
+    }
+
     /// Whether this mirror synced within [`FRESHNESS_WINDOW`], reports a
     /// plausible delay, and serves over HTTP(S) — the gate both the survey
     /// and the discovery pipeline apply before probing a mirror.

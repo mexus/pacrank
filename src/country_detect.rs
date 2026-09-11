@@ -343,7 +343,7 @@ async fn survey(
         .filter(|m| m.is_fresh() && m.country_code != CountryCode::Unknown)
         .filter_map(|m| {
             let host = m.url.host_str()?.to_owned();
-            let url = m.url.join("lastsync").ok()?;
+            let url = m.lastsync_url()?;
             Some((m.country_code, url, host))
         })
         .filter(|(_, _, host)| seen_hosts.insert(host.clone()))

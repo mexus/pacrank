@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use human_repr::HumanThroughput;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::{Rng, SeedableRng};
-use snafu::ResultExt;
+use snafu::{OptionExt, ResultExt};
 use url::Url;
 
 use crate::{
@@ -91,8 +91,7 @@ impl MirrorData<PingStatRunning> {
     /// (shouldn't happen for well-formed archlinux.org entries).
     pub fn try_new(mirror: Mirror) -> Result<Self, snafu::Whatever> {
         let last_sync_url = mirror
-            .url
-            .join("lastsync")
+            .lastsync_url()
             .whatever_context("Can't build the lastsync url")?;
         Ok(Self {
             mirror,
