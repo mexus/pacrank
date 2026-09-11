@@ -161,6 +161,15 @@ pub enum DetectError {
     /// Survey produced no usable samples and there is no cache to fall back
     /// on (e.g. offline first run).
     NoSamplesAndNoCache,
+    /// `DetectOptions::threshold` was not a positive number — zero,
+    /// negative or NaN. The cutoff such a threshold defines is degenerate
+    /// (every mirror dropped, or the comparison silently never fires), so
+    /// detection refuses to run rather than mis-select countries. The CLI
+    /// rejects the same values at the argument boundary with the flag's
+    /// name in the message; this variant is the contract for library
+    /// callers.
+    #[snafu(display("detect threshold must be positive, got {threshold}"))]
+    InvalidThreshold { threshold: f64 },
     /// After applying the latency threshold, no mirror survived; on a real
     /// machine this means every mirror is unreachable.
     NoCountriesSelected,
@@ -187,7 +196,10 @@ impl DetectError {
             // it), but the pipeline reconstructs the same client and runtime,
             // so a cache could not save them either.
             | Self::BuildClient { .. }
-            | Self::BuildRuntime { .. } => true,
+            | Self::BuildRuntime { .. }
+            // A caller-side bug, not a network condition: no cache fallback
+            // should paper over it.
+            | Self::InvalidThreshold { .. } => true,
             Self::NoIpAndNoCache | Self::NoSamplesAndNoCache | Self::NoCountriesSelected => false,
         }
     }
@@ -218,6 +230,17 @@ pub fn resolve(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectError> {
 }
 
 async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectError> {
+    // A non-positive threshold is a degenerate one: every latency exceeds
+    // `0 × baseline`, so selection would drop every mirror and fail with a
+    // much less actionable error than this one. (`NaN` fails the same
+    // comparison and is rejected here too.)
+    snafu::ensure!(
+        opts.threshold > 0.0,
+        InvalidThresholdSnafu {
+            threshold: opts.threshold
+        }
+    );
+
     // The survey warms this resolver ahead of the pings; handing the same
     // instance to reqwest is what turns those warm-ups into cache hits.
     let resolver = SurveyResolver::new();
@@ -773,6 +796,17 @@ mod test {
             DetectError::NoCountriesSelected,
         ] {
             assert!(!error.is_fatal(), "{error:?}");
+        }
+    }
+
+    /// A degenerate threshold is a caller bug, not a network condition —
+    /// the stale-cache fallback must not swallow it. NaN fails the same
+    /// comparison as every other non-positive value.
+    #[test]
+    fn a_degenerate_threshold_is_fatal() {
+        for threshold in [0.0, -1.5, f64::NAN] {
+            let error = DetectError::InvalidThreshold { threshold };
+            assert!(error.is_fatal(), "{error:?}");
         }
     }
 

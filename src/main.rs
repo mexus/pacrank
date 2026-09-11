@@ -92,10 +92,7 @@ fn main() -> Result<(), snafu::Whatever> {
     // `0 × baseline`, so auto-detection would drop every mirror and fail
     // with a much less actionable error than this one. (`NaN` fails the
     // same comparison and is rejected here too.)
-    snafu::ensure_whatever!(
-        detect_threshold > 0.0,
-        "--detect-threshold must be positive, got {detect_threshold}"
-    );
+    validate_detect_threshold(detect_threshold)?;
 
     init_tracing();
 
@@ -152,6 +149,21 @@ fn init_tracing() {
                 .from_env_lossy(),
         )
         .init();
+}
+
+/// Rejects a degenerate `--detect-threshold` right after argument parsing.
+///
+/// The zero/NaN cutoff makes selection drop every mirror (or never fire),
+/// and the library would only report that much later as a far-from-the-
+/// cause "no mirrors survived" after a full survey. The library's own
+/// `DetectError::InvalidThreshold` guards the same invariant for direct
+/// callers; this front door adds the flag's name to the message.
+fn validate_detect_threshold(threshold: f64) -> Result<(), snafu::Whatever> {
+    snafu::ensure_whatever!(
+        threshold > 0.0,
+        "--detect-threshold must be positive, got {threshold}"
+    );
+    Ok(())
 }
 
 /// Builds the argv to forward to a child process (sudo re-exec or
@@ -355,4 +367,32 @@ fn drop_privileges() -> Result<(), snafu::Whatever> {
     nix::unistd::setuid(user.uid)
         .whatever_context("CRITICAL SECURITY FAILURE: Could not drop user privileges")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::validate_detect_threshold;
+
+    #[test]
+    fn positive_thresholds_pass() {
+        for threshold in [1.5, f64::MIN_POSITIVE, 42.0, f64::INFINITY] {
+            assert!(
+                validate_detect_threshold(threshold).is_ok(),
+                "{threshold} is a usable multiplier"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_thresholds_are_rejected() {
+        // NaN fails the comparison like every other non-positive value;
+        // -0.0 is not greater than zero either.
+        for threshold in [0.0, -0.0, -1.5, f64::NAN, f64::NEG_INFINITY] {
+            let err = validate_detect_threshold(threshold).expect_err("must be rejected");
+            assert!(
+                err.to_string().contains("--detect-threshold"),
+                "the message should name the flag: {err}"
+            );
+        }
+    }
 }
