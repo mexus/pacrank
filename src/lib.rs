@@ -24,7 +24,7 @@ pub mod dns;
 pub mod largest_file_discovery;
 /// Types mirroring the `mirrors/status/json/` endpoint plus country codes.
 pub mod mirrors;
-/// Summary statistics (bootstrap confidence intervals) over ping samples.
+/// Summary statistics over ping samples.
 pub mod ping_stat;
 /// Repeated latency probing against an HTTP endpoint, plus a self-tuning
 /// cap for cold probes.

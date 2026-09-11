@@ -1,7 +1,5 @@
 use std::time::Duration;
 
-use rand::{Rng, RngExt};
-
 use crate::ping_test::Probe;
 
 /// Accumulates raw latency samples during the ping phase.
@@ -12,7 +10,7 @@ use crate::ping_test::Probe;
 ///
 /// Cold and warm probes (see [`Probe::cold`]) land in separate buckets: the
 /// cold one becomes the mirror's *setup* figure, and only warm samples feed
-/// the bootstrap statistics. The distinction matters because the statistics
+/// the summary statistics. The distinction matters because the statistics
 /// run over the **mean** — with a handful of samples, one connection setup
 /// (TCP + TLS, easily several times the request round-trip) would visibly
 /// skew the headline number where a median would have shrugged it off.
@@ -23,35 +21,23 @@ pub struct PingStatRunning {
 }
 
 /// Summary statistics derived from a set of [`PingStatRunning`] samples.
-///
-/// `low` and `high` are the bounds of a 90% bootstrap confidence interval
-/// around the mean latency; `median` is the bootstrap median. See
-/// [`PingStatRunning::bootstrap_range`] for the derivation.
 #[derive(Debug, Clone, Copy)]
 pub struct PingStatComputed {
-    low: Duration,
-    high: Duration,
-    median: Duration,
+    mean: Duration,
     setup: Option<Duration>,
 }
 
 impl PingStatComputed {
-    /// Lower bound of the 90% confidence interval (5th percentile of the
-    /// bootstrap means).
-    pub fn low(&self) -> Duration {
-        self.low
-    }
-
-    /// Upper bound of the 90% confidence interval (95th percentile of the
-    /// bootstrap means).
-    pub fn high(&self) -> Duration {
-        self.high
-    }
-
-    /// Median of the bootstrap means — the headline latency figure used for
+    /// Mean of the warm samples — the headline latency figure used for
     /// ranking mirrors.
-    pub fn median(&self) -> Duration {
-        self.median
+    ///
+    /// The plain mean, not a median or a trimmed variant: with the two warm
+    /// samples the latency phase collects, every robust variant degenerates
+    /// into picking one of the two probes, while the average at least uses
+    /// both. (This replaced a 10 000-resample bootstrap whose median is the
+    /// sample mean by construction at that sample size.)
+    pub fn mean(&self) -> Duration {
+        self.mean
     }
 
     /// Latency of the cold probe: connection setup (TCP + TLS) plus one
@@ -96,7 +82,7 @@ impl PingStatRunning {
 
     /// Median of the warm samples (upper median for even counts), or `None`
     /// with no warm samples. This is the cheap point estimate the country
-    /// survey ranks by — unlike [`Self::compute`], no bootstrap.
+    /// survey ranks by — unlike [`Self::compute`], no finalization.
     pub fn warm_median(&self) -> Option<Duration> {
         let mut warm = self.warm.clone();
         warm.sort_unstable();
@@ -106,80 +92,22 @@ impl PingStatRunning {
     /// Finalizes the running statistics into an immutable [`PingStatComputed`],
     /// or `None` when there are no warm samples to compute statistics over.
     ///
-    /// Runs the bootstrap resampling once; the provided `rng` drives the
-    /// resampling draws.
-    pub fn compute<R>(&self, rng: &mut R) -> Option<PingStatComputed>
-    where
-        R: Rng + ?Sized,
-    {
+    /// Pure: a mirror's summary is a function of its own samples alone — no
+    /// RNG, no coupling to iteration order.
+    pub fn compute(&self) -> Option<PingStatComputed> {
         if self.warm.is_empty() {
             return None;
         }
-        let (low, median, high) = self.bootstrap_range(rng);
+        let secs = self.warm.iter().map(|d| d.as_secs_f64()).sum::<f64>() / self.warm.len() as f64;
         Some(PingStatComputed {
-            low,
-            high,
-            median,
+            mean: Duration::from_secs_f64(secs),
             setup: self.setup,
         })
-    }
-
-    /// Returns a 90% confidence range around the mean latency of the warm
-    /// samples as `(p05, median, p95)`.
-    ///
-    /// Uses non-parametric bootstrap resampling: draw `warm.len()`
-    /// samples with replacement from the observed samples, take the mean,
-    /// repeat `REPEATS` times, then read off the 5th / 50th / 95th
-    /// percentiles of the collected means. This gives a distribution-free
-    /// estimate of how much the observed mean could vary under re-sampling,
-    /// which is useful when the sample size is small (a handful of pings).
-    pub fn bootstrap_range<R: Rng + ?Sized>(&self, rng: &mut R) -> (Duration, Duration, Duration) {
-        const REPEATS: usize = 10_000;
-
-        let warm_count = self.warm.len();
-        // Degenerate cases: no point resampling if there's nothing to sample
-        // from, or only one sample (every resample returns the same value).
-        if warm_count == 0 {
-            return (Duration::MAX, Duration::MAX, Duration::MAX);
-        } else if warm_count == 1 {
-            let the_only = self.warm[0];
-            return (the_only, the_only, the_only);
-        }
-
-        // Reuse a single buffer across iterations to avoid REPEATS allocations.
-        let mut resampled = self.warm.clone();
-        let distr = rand::distr::Uniform::new(0, warm_count).expect("Must be OK");
-
-        let mut means = Vec::with_capacity(REPEATS);
-        for _ in 0..REPEATS {
-            for sample in &mut resampled {
-                *sample = self.warm[rng.sample(distr)];
-            }
-            let mean = resampled.iter().map(|d| d.as_secs_f64()).sum::<f64>() / warm_count as f64;
-            means.push(mean);
-        }
-        means.sort_by(f64::total_cmp);
-
-        // Order-of-operations matters: `REPEATS * 5 / 100` keeps integer
-        // truncation at the end, so smaller `REPEATS` values still land on a
-        // non-zero index. The `- 1` converts 1-based percentile rank to a
-        // 0-based array index.
-        let p_05 = means[REPEATS * 5 / 100 - 1];
-        let median = means[REPEATS / 2 - 1];
-        let p_95 = means[REPEATS * 95 / 100 - 1];
-
-        (
-            Duration::from_secs_f64(p_05),
-            Duration::from_secs_f64(median),
-            Duration::from_secs_f64(p_95),
-        )
     }
 }
 
 #[cfg(test)]
 mod test {
-    use rand::{SeedableRng, rngs::StdRng};
-
     use super::*;
 
     fn warm(ms: u64) -> Probe {
@@ -196,23 +124,19 @@ mod test {
         }
     }
 
-    fn rng() -> StdRng {
-        StdRng::seed_from_u64(1337)
-    }
-
     #[test]
     fn setup_only_computes_to_none() {
         let mut stat = PingStatRunning::default();
         stat.record_ping(cold(300));
         assert!(stat.is_setup_only());
-        assert!(stat.compute(&mut rng()).is_none());
+        assert!(stat.compute().is_none());
     }
 
     #[test]
     fn no_samples_at_all_computes_to_none() {
         let stat = PingStatRunning::default();
         assert!(!stat.is_setup_only());
-        assert!(stat.compute(&mut rng()).is_none());
+        assert!(stat.compute().is_none());
     }
 
     #[test]
@@ -225,27 +149,35 @@ mod test {
             stat.record_ping(warm(20));
             stat.record_ping(warm(30));
         }
-        // Identical warm samples + identical rng seed → identical statistics,
-        // no matter how heavy the setup sample was.
-        let a = with_setup.compute(&mut rng()).unwrap();
-        let b = without_setup.compute(&mut rng()).unwrap();
-        assert_eq!(a.median(), b.median());
-        assert_eq!(a.low(), b.low());
-        assert_eq!(a.high(), b.high());
+        // Identical warm samples → identical statistics, no matter how
+        // heavy the setup sample was.
+        let a = with_setup.compute().unwrap();
+        let b = without_setup.compute().unwrap();
+        assert_eq!(a.mean(), b.mean());
         assert_eq!(a.setup(), Some(Duration::from_millis(900)));
         assert_eq!(b.setup(), None);
     }
 
     #[test]
-    fn single_warm_sample_collapses_the_interval() {
+    fn single_warm_sample_is_the_mean() {
         let mut stat = PingStatRunning::default();
         stat.record_ping(cold(500));
         stat.record_ping(warm(42));
-        let computed = stat.compute(&mut rng()).unwrap();
-        let expected = Duration::from_millis(42);
-        assert_eq!(computed.low(), expected);
-        assert_eq!(computed.median(), expected);
-        assert_eq!(computed.high(), expected);
+        let computed = stat.compute().unwrap();
+        assert_eq!(computed.mean(), Duration::from_millis(42));
+    }
+
+    /// The mean averages every warm sample — with two samples the
+    /// statistics can't degenerate into reporting just one of them.
+    #[test]
+    fn mean_averages_all_warm_samples() {
+        let mut stat = PingStatRunning::default();
+        stat.record_ping(warm(10));
+        stat.record_ping(warm(30));
+        assert_eq!(stat.compute().unwrap().mean(), Duration::from_millis(20));
+
+        stat.record_ping(warm(20));
+        assert_eq!(stat.compute().unwrap().mean(), Duration::from_millis(20));
     }
 
     #[test]
@@ -256,7 +188,7 @@ mod test {
         stat.record_ping(cold(300));
         stat.record_ping(cold(700));
         stat.record_ping(warm(10));
-        let computed = stat.compute(&mut rng()).unwrap();
+        let computed = stat.compute().unwrap();
         assert_eq!(computed.setup(), Some(Duration::from_millis(300)));
     }
 }

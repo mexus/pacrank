@@ -14,7 +14,6 @@ use display_error_chain::DisplayErrorChain;
 use futures_util::StreamExt;
 use human_repr::HumanThroughput;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rand::{Rng, SeedableRng};
 use snafu::{OptionExt, ResultExt};
 use url::Url;
 
@@ -26,7 +25,7 @@ use crate::{
 /// How long the latency phase probes mirrors before statistics are computed.
 ///
 /// At one probe a second this yields a cold probe plus a handful of warm
-/// ones per mirror — enough for a stable median without stalling the run.
+/// ones per mirror — enough for a stable mean without stalling the run.
 const LATENCY_PHASE_DURATION: Duration = Duration::from_secs(3);
 
 /// Interval between probes against the same mirror in the latency phase
@@ -37,10 +36,10 @@ const LATENCY_PHASE_DURATION: Duration = Duration::from_secs(3);
 /// one lucky instant.
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// A mirror whose bootstrap median exceeds this is dropped: even perfect
+/// A mirror whose mean latency exceeds this is dropped: even perfect
 /// throughput cannot hide a second of round-trip time on every request
 /// pacman makes.
-const MAX_ACCEPTABLE_MEDIAN: Duration = Duration::from_secs(1);
+const MAX_ACCEPTABLE_MEAN: Duration = Duration::from_secs(1);
 
 /// Synchronous wrapper that spins up a Tokio runtime and runs the async
 /// discovery pipeline to completion.
@@ -66,7 +65,7 @@ pub fn discover_best_mirrors(
 /// Two independent typestate parameters track pipeline progress:
 ///
 /// - `PING` — [`PingStatRunning`] during the latency phase,
-///   [`PingStatComputed`] after statistics are bootstrapped.
+///   [`PingStatComputed`] after its statistics have been computed.
 /// - `DL` — `Option<f64>` while throughput is being measured (some mirrors
 ///   will fail to produce a number), bare `f64` after ranking has filtered
 ///   out the failures; the latter makes "has a measured speed" a
@@ -107,10 +106,7 @@ impl MirrorData<PingStatRunning> {
     ///
     /// Consumes `self`: the phase transition moves the per-mirror fields
     /// (URL, bookkeeping) along instead of cloning them per mirror.
-    pub fn compute_pings<R: ?Sized + Rng>(
-        self,
-        rng: &mut R,
-    ) -> Option<MirrorData<PingStatComputed>> {
+    pub fn compute_pings(self) -> Option<MirrorData<PingStatComputed>> {
         let Self {
             mirror,
             last_sync_url,
@@ -120,7 +116,7 @@ impl MirrorData<PingStatRunning> {
         Some(MirrorData {
             mirror,
             last_sync_url,
-            ping_stat: ping_stat.compute(rng)?,
+            ping_stat: ping_stat.compute()?,
             dl_speed,
         })
     }
@@ -300,16 +296,12 @@ pub async fn latency_phase(
     mirrors
 }
 
-/// Phase 2b: turns raw ping samples into bootstrap statistics, drops anything
-/// slower than 1s median, then keeps the `ping_k` fastest survivors.
+/// Phase 2b: turns raw ping samples into summary statistics, drops anything
+/// slower than a 1s mean, then keeps the `ping_k` fastest survivors.
 pub fn compute_and_filter_pings(
     mirrors: Vec<MirrorData<PingStatRunning>>,
     ping_k: NonZeroUsize,
 ) -> Result<Vec<MirrorData<PingStatComputed>>, snafu::Whatever> {
-    // Seeded with a constant so the bootstrap resampling produces the same
-    // confidence intervals for the same inputs across runs — useful when
-    // comparing two invocations made minutes apart.
-    let mut rng = rand::rngs::StdRng::seed_from_u64(1337);
     // A mirror whose only success was the cold probe is dropped outright
     // rather than judged by its handshake sample. The count below is a
     // provisional metric watching that policy's cost: if it stays high, the
@@ -335,19 +327,19 @@ pub fn compute_and_filter_pings(
             );
             continue;
         }
-        let Some(computed) = data.compute_pings(&mut rng) else {
+        let Some(computed) = data.compute_pings() else {
             // No warm samples and no setup sample: a fully dead mirror, not
             // worth a log line of its own.
             continue;
         };
-        // Anything slower than the acceptable median is not worth the
+        // Anything slower than the acceptable mean is not worth the
         // download test.
-        if computed.ping_stat.median() <= MAX_ACCEPTABLE_MEDIAN {
+        if computed.ping_stat.mean() <= MAX_ACCEPTABLE_MEAN {
             kept.push(computed);
         }
     }
     snafu::ensure_whatever!(!kept.is_empty(), "No servers to continue with");
-    kept.sort_by_key(|m| m.ping_stat.median());
+    kept.sort_by_key(|m| m.ping_stat.mean());
     kept.truncate(ping_k.get());
     tracing::info!(
         "Latency phase finished, kept {} mirrors ({setup_only} dropped as setup-only)",
@@ -355,17 +347,12 @@ pub fn compute_and_filter_pings(
     );
     if tracing::enabled!(tracing::Level::DEBUG) {
         for data in &kept {
-            let low = data.ping_stat.low();
-            let high = data.ping_stat.high();
-            let median = data.ping_stat.median();
+            let mean = data.ping_stat.mean();
             let setup = data
                 .ping_stat
                 .setup()
                 .map_or_else(|| "n/a".to_owned(), |s| format!("{s:.2?}"));
-            tracing::debug!(
-                { %data.mirror.url },
-                "90% in {low:.2?}..{high:.2?}, median = {median:.2?}, setup = {setup}",
-            );
+            tracing::debug!({ %data.mirror.url }, "mean = {mean:.2?}, setup = {setup}",);
         }
     }
     Ok(kept)
@@ -433,7 +420,7 @@ pub fn print_summary(mirrors: &[MirrorData<PingStatComputed, f64>]) {
             "{}:\n  * DL speed: {}\n  * TTFB: {:.2?}",
             data.mirror.url,
             data.dl_speed.human_throughput_bytes(),
-            data.ping_stat.median()
+            data.ping_stat.mean()
         );
     }
 }
@@ -484,8 +471,6 @@ pub async fn dl_mirror<T>(
 
 #[cfg(test)]
 mod test {
-    use rand::rngs::StdRng;
-
     use super::*;
     use crate::mirrors::Protocol;
     use crate::ping_test::Probe;
@@ -523,12 +508,10 @@ mod test {
     }
 
     /// The same entry after `compute_pings` — with uniform warm samples the
-    /// bootstrap median collapses onto the sample value, so callers can
-    /// assert exact latencies.
+    /// mean is the sample value, so callers can assert exact latencies.
     fn computed(n: usize, warm_ms: &[u64]) -> MirrorData<PingStatComputed> {
-        let mut rng = StdRng::seed_from_u64(1337);
         running(n, warm_ms, Some(50))
-            .compute_pings(&mut rng)
+            .compute_pings()
             .expect("warm samples must compute")
     }
 
@@ -551,29 +534,29 @@ mod test {
             "https://mirror-0.example.com/archlinux/"
         );
         // The surviving one is the warm one, despite the slower setup.
-        assert_eq!(kept[0].ping_stat.median(), Duration::from_millis(110));
+        assert_eq!(kept[0].ping_stat.mean(), Duration::from_millis(110));
     }
 
-    /// A bootstrap median above `MAX_ACCEPTABLE_MEDIAN` disqualifies the
-    /// mirror from the throughput phase.
+    /// A mean above `MAX_ACCEPTABLE_MEAN` disqualifies the mirror from the
+    /// throughput phase.
     #[test]
-    fn slow_medians_are_dropped() {
+    fn slow_means_are_dropped() {
         let mirrors = vec![running(0, &[1500, 1500], Some(400))];
         assert!(compute_and_filter_pings(mirrors, ping_k(10)).is_err());
     }
 
-    /// `ping_k` keeps the fastest survivors, sorted by median ascending.
+    /// `ping_k` keeps the fastest survivors, sorted by mean ascending.
     #[test]
-    fn ping_k_truncates_to_the_fastest_in_median_order() {
+    fn ping_k_truncates_to_the_fastest_in_mean_order() {
         let mirrors = vec![
             running(0, &[300, 300], Some(400)),
             running(1, &[100, 100], Some(400)),
             running(2, &[200, 200], Some(400)),
         ];
         let kept = compute_and_filter_pings(mirrors, ping_k(2)).unwrap();
-        let medians: Vec<Duration> = kept.iter().map(|m| m.ping_stat.median()).collect();
+        let means: Vec<Duration> = kept.iter().map(|m| m.ping_stat.mean()).collect();
         assert_eq!(
-            medians,
+            means,
             [Duration::from_millis(100), Duration::from_millis(200)]
         );
     }
