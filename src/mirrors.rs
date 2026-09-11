@@ -1,6 +1,6 @@
 //! Mirror-related utilities.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 /// Version-aware mirrors list.
 #[derive(Debug, Clone)]
@@ -320,7 +320,26 @@ impl Mirror {
     pub fn is_http(&self) -> bool {
         matches!(self.protocol, Protocol::Http | Protocol::Https)
     }
+
+    /// Whether this mirror synced within [`FRESHNESS_WINDOW`], reports a
+    /// plausible delay, and serves over HTTP(S) — the gate both the survey
+    /// and the discovery pipeline apply before probing a mirror.
+    pub fn is_fresh(&self) -> bool {
+        let oldest_sync = time::OffsetDateTime::now_utc() - FRESHNESS_WINDOW;
+        self.is_http()
+            && self.last_sync.is_some_and(|ts| ts >= oldest_sync)
+            && self
+                .delay
+                .is_some_and(|d| d <= FRESHNESS_WINDOW.as_secs() as i64)
+    }
 }
+
+/// How recent a mirror's last sync must be for either stage to consider it.
+///
+/// 48 h is a loose freshness gate: a mirror briefly behind during its own
+/// sync cycle might still be the fastest, so the cutoff must not be tight.
+/// Anything staler than that is almost certainly broken.
+pub const FRESHNESS_WINDOW: Duration = Duration::from_hours(48);
 
 /// Endpoint carrying the official mirror status document.
 const STATUS_URL: &str = "https://archlinux.org/mirrors/status/json/";

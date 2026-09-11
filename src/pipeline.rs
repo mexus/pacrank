@@ -16,7 +16,6 @@ use human_repr::HumanThroughput;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rand::{Rng, SeedableRng};
 use snafu::ResultExt;
-use time::OffsetDateTime;
 use url::Url;
 
 use crate::{
@@ -170,21 +169,14 @@ pub async fn fetch_and_filter_mirrors(
         .whatever_context("Can't fetch the mirrors list")?;
     tracing::info!("Fetched {} mirrors", mirrors.urls.len());
 
-    // 48h is a loose freshness gate: a mirror that's briefly behind during
-    // its own sync cycle might still be the fastest, so we don't want the
-    // cutoff too tight. Anything staler than that is almost certainly broken.
-    let max_delay = Duration::from_hours(48);
-    let oldest_sync = OffsetDateTime::now_utc() - max_delay;
+    // The freshness/protocol gate both stages share: see
+    // `Mirror::is_fresh`.
     let kept = mirrors
         .urls
         .into_iter()
         .filter_map(|mirror| {
-            if let Some(last_sync) = mirror.last_sync
-                && let Some(delay) = mirror.delay
-                && last_sync >= oldest_sync
-                && delay <= max_delay.as_secs() as i64
+            if mirror.is_fresh()
                 && countries.contains(&mirror.country_code)
-                && mirror.is_http()
                 && let Ok(mirror_data) = MirrorData::try_new(mirror)
             {
                 Some(mirror_data)
@@ -489,7 +481,7 @@ mod test {
             protocol: Protocol::Https,
             country_code: CountryCode::DE,
             delay: Some(60),
-            last_sync: Some(OffsetDateTime::now_utc()),
+            last_sync: Some(time::OffsetDateTime::now_utc()),
         }
     }
 

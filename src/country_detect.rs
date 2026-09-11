@@ -332,8 +332,6 @@ async fn survey(
         .await
         .context(FetchMirrorsSnafu)?;
 
-    let max_delay = Duration::from_hours(48);
-    let oldest_sync = OffsetDateTime::now_utc() - max_delay;
     // One entry per host. `http://X` and `https://X` are two mirrors but one
     // machine in one country, so probing both answers the same question twice;
     // dropping the duplicates takes ~805 entries down to ~487 for free.
@@ -341,12 +339,7 @@ async fn survey(
     let candidates: Vec<_> = mirrors
         .urls
         .into_iter()
-        .filter(|m| {
-            m.is_http()
-                && m.country_code != CountryCode::Unknown
-                && m.last_sync.is_some_and(|ts| ts >= oldest_sync)
-                && m.delay.is_some_and(|d| d <= max_delay.as_secs() as i64)
-        })
+        .filter(|m| m.is_fresh() && m.country_code != CountryCode::Unknown)
         .filter_map(|m| {
             let host = m.url.host_str()?.to_owned();
             let url = m.url.join("lastsync").ok()?;
