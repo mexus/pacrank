@@ -11,6 +11,13 @@ use futures_util::Stream;
 use rand::{Rng, RngExt};
 use reqwest::IntoUrl;
 
+/// Fraction of a probe interval used as random jitter, as in "±10%".
+///
+/// Spreading probe starts over a tenth of their interval keeps the phase's
+/// requests from marching in lockstep — a burst of simultaneous HEADs is
+/// exactly what the interval exists to prevent.
+const JITTER_FRACTION: f64 = 0.1;
+
 /// A self-tuning cap for cold probes, shared by every stream of one
 /// measurement run.
 ///
@@ -228,7 +235,7 @@ pub fn ping_url(
                 CacheBust::PerProbe => bust_url(&url, rng.random()),
                 CacheBust::Off => url.clone(),
             };
-            let interval = jitter_duration(interval, 0.1, &mut rng);
+            let interval = jitter_duration(interval, &mut rng);
             // `reqwest::Client` is internally `Arc`-based, so cloning is a cheap
             // refcount bump — cheaper than threading a shared borrow through the
             // async state machine.
@@ -288,22 +295,9 @@ pub fn ping_url(
     )
 }
 
-/// Applies a random jitter to a `Duration`.
-///
-/// `jitter_fraction` must be strictly between 0.0 and 1.0 (exclusive).
-/// If it falls outside this range, the original duration is returned unchanged.
-fn jitter_duration<R: Rng + ?Sized>(
-    duration: Duration,
-    jitter_fraction: f64,
-    rng: &mut R,
-) -> Duration {
-    // Strict range: 0.0 < fraction < 1.0
-    // This condition also safely evaluates to false if jitter_fraction is NaN.
-    if !(0.0 < jitter_fraction && jitter_fraction < 1.0) {
-        return duration;
-    }
-
-    let factor = rng.random_range(-jitter_fraction..=jitter_fraction);
+/// Applies a random jitter of ±[`JITTER_FRACTION`] to a `Duration`.
+fn jitter_duration<R: Rng + ?Sized>(duration: Duration, rng: &mut R) -> Duration {
+    let factor = rng.random_range(-JITTER_FRACTION..=JITTER_FRACTION);
 
     // Because factor is strictly > -1.0, (1.0 + factor) is always positive.
     // Mathematical underflow is impossible here.
@@ -328,39 +322,25 @@ mod test {
         StdRng::seed_from_u64(42)
     }
 
-    #[test]
-    fn test_invalid_fractions_return_original_duration() {
-        let mut rng = mock_rng();
-        let base = Duration::from_secs(10);
-
-        // 0.0 and 1.0 are explicitly excluded
-        assert_eq!(jitter_duration(base, 0.0, &mut rng), base);
-        assert_eq!(jitter_duration(base, 1.0, &mut rng), base);
-
-        // Out of bounds
-        assert_eq!(jitter_duration(base, -0.1, &mut rng), base);
-        assert_eq!(jitter_duration(base, 1.5, &mut rng), base);
-
-        // NaN check
-        assert_eq!(jitter_duration(base, f64::NAN, &mut rng), base);
-    }
-
+    /// Jittering a known duration keeps it within ±[`JITTER_FRACTION`],
+    /// across many draws of the seeded RNG.
     #[test]
     fn test_jitter_stays_within_bounds() {
-        let mut rng = mock_rng();
         let base = Duration::from_millis(1000);
-        let fraction = 0.5; // ±50%
 
-        let min_bound = Duration::from_millis(500);
-        let max_bound = Duration::from_millis(1500);
+        let min_bound = Duration::from_millis(900);
+        let max_bound = Duration::from_millis(1100);
 
-        for _ in 0..1000 {
-            let result = jitter_duration(base, fraction, &mut rng);
-            assert!(
-                result >= min_bound && result <= max_bound,
-                "Duration {:?} fell out of bounds",
-                result
-            );
+        for seed in 0..5 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            for _ in 0..1000 {
+                let result = jitter_duration(base, &mut rng);
+                assert!(
+                    result >= min_bound && result <= max_bound,
+                    "Duration {:?} fell out of bounds",
+                    result
+                );
+            }
         }
     }
 
@@ -370,7 +350,7 @@ mod test {
         let base = Duration::ZERO;
 
         // 0 multiplied by anything is 0
-        let result = jitter_duration(base, 0.99, &mut rng);
+        let result = jitter_duration(base, &mut rng);
         assert_eq!(result, Duration::ZERO);
     }
 
@@ -381,7 +361,7 @@ mod test {
 
         // Jittering Duration::MAX upward overflows f64's bounds for Duration.
         // This ensures the upper-bound check successfully catches it.
-        let result = jitter_duration(base, 0.5, &mut rng);
+        let result = jitter_duration(base, &mut rng);
 
         assert!(result <= Duration::MAX);
     }
