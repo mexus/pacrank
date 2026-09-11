@@ -319,10 +319,11 @@ impl Default for SurveyResolver {
 
 /// What one resolve stage lost, and to what.
 ///
-/// Counts *lookups*, not distinct names: the main pipeline warms `http://X`
-/// and `https://X` as two separate mirrors, so a host that fails contributes
-/// twice — which is also how it counts twice in the stage's own total, leaving
-/// the ratio honest.
+/// Counts *lookups*, and both stages warm each distinct hostname exactly
+/// once — the list's `http://X` / `https://X` twins share a lookup — so a
+/// failing host contributes a single entry even though all of its mirrors
+/// leave with it. Each stage reports against its own lookup count, which is
+/// what keeps the ratio honest.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FailureReport {
     counts: BTreeMap<Cause, usize>,

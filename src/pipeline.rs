@@ -6,6 +6,7 @@
 //! the worker protocol, and the mirrorlist rewrite.
 
 use std::{
+    collections::HashSet,
     num::NonZeroUsize,
     time::{Duration, Instant},
 };
@@ -204,35 +205,56 @@ pub async fn fetch_and_filter_mirrors(
 /// The same split the survey performs (see `country_detect`): with the cache
 /// warm, no ping sample ever includes DNS time — the client reads addresses
 /// straight from the cache — and a dead name costs one lookup here instead of
-/// occupying a whole ping stream for the phase. The `http://X` / `https://X`
-/// twins of one host collapse into a single lookup for free.
+/// occupying a whole ping stream for the phase.
+///
+/// Hostnames are deduplicated before warming, exactly like the survey's
+/// candidate list: the mirror list carries `http://X` and `https://X` as two
+/// mirrors sharing one name, and the cache cannot collapse two lookups that
+/// race — warmed concurrently, each twin would burn its own lookup and, when
+/// the resolver is already struggling, its own retry ladder. One lookup per
+/// name is also one verdict per name: twins can no longer diverge over
+/// whether their host resolves.
 pub async fn resolve_phase(
     resolver: &crate::dns::SurveyResolver,
     mirrors: Vec<MirrorData<PingStatRunning>>,
 ) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
     let total = mirrors.len();
-    let resolved: Vec<_> = futures_util::stream::iter(mirrors)
-        .map(|data| {
-            // Owned copy: `warm` must not borrow from the `data` the future
-            // moves out on success.
-            let host = data.mirror.url.host_str().map(str::to_owned);
-            async move {
-                let host = host?;
-                resolver.warm(&host).await.then_some(data)
-            }
-        })
+    // One warm per distinct hostname, in first-seen order — the same
+    // `seen_hosts` idiom the survey's candidate list uses. A mirror with no
+    // hostname at all never makes the cut either.
+    let mut seen_hosts = HashSet::new();
+    let hosts: Vec<String> = mirrors
+        .iter()
+        .filter_map(|data| data.mirror.url.host_str().map(str::to_owned))
+        .filter(|host| seen_hosts.insert(host.clone()))
+        .collect();
+    let lookups = hosts.len();
+    let resolved: HashSet<_> = futures_util::stream::iter(hosts)
+        .map(|host| async move { resolver.warm(&host).await.then_some(host) })
         .buffer_unordered(resolver.lookup_concurrency())
         .filter_map(std::future::ready)
         .collect()
         .await;
+    let mirrors: Vec<_> = mirrors
+        .into_iter()
+        .filter(|data| {
+            data.mirror
+                .url
+                .host_str()
+                .is_some_and(|host| resolved.contains(host))
+        })
+        .collect();
     let failures = resolver.take_failures();
     snafu::ensure_whatever!(
-        !resolved.is_empty(),
+        !mirrors.is_empty(),
         "No mirror hostname resolved ({failures})"
     );
-    tracing::info!("Name resolution kept {}/{total} mirrors", resolved.len());
-    failures.warn_if_resolver_bound(total);
-    Ok(resolved)
+    tracing::info!("Name resolution kept {}/{total} mirrors", mirrors.len());
+    // Against lookups, not mirrors: the tally holds one entry per distinct
+    // failing host, so the lookup count is the denominator that keeps the
+    // ratio honest — the convention the survey already reports against.
+    failures.warn_if_resolver_bound(lookups);
+    Ok(mirrors)
 }
 
 /// Phase 2a: probes every mirror's `lastsync` URL for `duration`, recording
