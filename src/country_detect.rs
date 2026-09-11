@@ -392,9 +392,10 @@ async fn survey(
         .filter(|(_, _, host)| seen_hosts.insert(host.clone()))
         .collect();
 
+    let candidate_count = candidates.len();
     tracing::info!(
-        "Auto-detecting closest countries by probing {} mirrors ({} lookups, {} pings in flight).",
-        candidates.len(),
+        "Auto-detecting closest countries by probing {candidate_count} mirrors ({} lookups, {} \
+         pings in flight).",
         resolver.lookup_concurrency(),
         SURVEY_CONCURRENCY,
     );
@@ -503,6 +504,13 @@ async fn survey(
     resolve_bar.finish_and_clear();
     leaders_bar.finish_and_clear();
     drop(progress);
+
+    // After the bars are gone, so the warning is not painted over — and after
+    // the stream is drained, since resolution here is interleaved with the
+    // pings rather than finished up front.
+    resolver
+        .take_failures()
+        .warn_if_resolver_bound(candidate_count);
 
     if setup_only > 0 {
         tracing::info!(

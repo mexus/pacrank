@@ -552,8 +552,13 @@ async fn resolve_phase(
         .filter_map(std::future::ready)
         .collect()
         .await;
-    snafu::ensure_whatever!(!resolved.is_empty(), "No mirror hostname resolved");
+    let failures = resolver.take_failures();
+    snafu::ensure_whatever!(
+        !resolved.is_empty(),
+        "No mirror hostname resolved ({failures})"
+    );
     tracing::info!("Name resolution kept {}/{total} mirrors", resolved.len());
+    failures.warn_if_resolver_bound(total);
     Ok(resolved)
 }
 
