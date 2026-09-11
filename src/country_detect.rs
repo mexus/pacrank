@@ -105,7 +105,11 @@ const CDN_SUSPECT_SETUP_FLOOR: Duration = Duration::from_millis(100);
 /// runs on that pool and cannot be cancelled, so an abandoned lookup keeps
 /// polling the DNS socket for up to ~102s after [`crate::dns::LOOKUP_TIMEOUT`]
 /// said we stopped caring. Cap the wait; the stragglers die with the process.
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+///
+/// `pub` for now only because the binary's runtime teardown references it;
+/// once the pipeline moves into the library (refactoring plan T1.1) this can
+/// be `pub(crate)` — its final home is T1.2's move next to the DNS code.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
 /// Cached countries are considered fresh for this long even when the public
 /// IP /16 still matches; after this we re-detect to catch shifts in the

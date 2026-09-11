@@ -285,10 +285,16 @@ fn spawn_worker_and_read_mirrors(child_args: &[String]) -> Result<Vec<Url>, snaf
         .whatever_context("Discovering the best mirrors has failed")
 }
 
+/// The pacman configuration directory the mirrorlist lives in.
+const PACMAN_D_DIR: &str = "/etc/pacman.d/";
+
+/// The mirrorlist file this tool atomically replaces.
+const MIRRORLIST_PATH: &str = "/etc/pacman.d/mirrorlist";
+
 /// Atomically replaces `/etc/pacman.d/mirrorlist` with pacman-compatible
 /// `Server = ...` lines derived from the given URLs.
 fn write_mirrorlist(mirrors: &[Url]) -> Result<(), snafu::Whatever> {
-    let original = Utf8Path::new("/etc/pacman.d/mirrorlist");
+    let original = Utf8Path::new(MIRRORLIST_PATH);
     let meta = original
         .metadata()
         .whatever_context("Can't get the mirrorlist's meta")?;
@@ -299,7 +305,7 @@ fn write_mirrorlist(mirrors: &[Url]) -> Result<(), snafu::Whatever> {
     let gid = meta.gid();
     // Write into a NamedTempFile in the same directory as the target so the
     // final `persist()` is an atomic rename on the same filesystem.
-    let mut output = tempfile::NamedTempFile::new_in("/etc/pacman.d/")
+    let mut output = tempfile::NamedTempFile::new_in(PACMAN_D_DIR)
         .whatever_context("Can't create a temporary file")?;
     for url in mirrors {
         use std::io::Write;
@@ -322,7 +328,7 @@ fn write_mirrorlist(mirrors: &[Url]) -> Result<(), snafu::Whatever> {
     fchown(output.as_file(), Some(uid), Some(gid))
         .whatever_context("Unable to update ownership of the temporary file")?;
     output
-        .persist("/etc/pacman.d/mirrorlist")
+        .persist(MIRRORLIST_PATH)
         .whatever_context("Unable to persist the mirror list")?;
     tracing::info!("Mirrors list updated successfully");
     Ok(())
@@ -350,6 +356,25 @@ fn drop_privileges() -> Result<(), snafu::Whatever> {
 
 // ---------- Discovery pipeline ----------
 
+/// How long the latency phase probes mirrors before statistics are computed.
+///
+/// At one probe a second this yields a cold probe plus a handful of warm
+/// ones per mirror — enough for a stable median without stalling the run.
+const LATENCY_PHASE_DURATION: Duration = Duration::from_secs(3);
+
+/// Interval between probes against the same mirror in the latency phase
+/// (jittered ±10% inside `ping_url`).
+///
+/// Unlike the country survey, which only needs a rough screen, this phase
+/// spaces probes apart to sample latency across time rather than measuring
+/// one lucky instant.
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
+/// A mirror whose bootstrap median exceeds this is dropped: even perfect
+/// throughput cannot hide a second of round-trip time on every request
+/// pacman makes.
+const MAX_ACCEPTABLE_MEDIAN: Duration = Duration::from_secs(1);
+
 /// Synchronous wrapper that spins up a Tokio runtime and runs the async
 /// discovery pipeline to completion.
 fn discover_best_mirrors(
@@ -363,8 +388,9 @@ fn discover_best_mirrors(
         .whatever_context("Can't initialize Tokio")?;
     let result = rt.block_on(discover_best_mirrors_impl(dl_k, ping_k, countries));
     // Never a plain `drop(rt)`: it would block until every abandoned
-    // `getaddrinfo` blocking task returns. See `country_detect::SHUTDOWN_GRACE`.
-    rt.shutdown_timeout(Duration::from_millis(100));
+    // `getaddrinfo` blocking task returns. See
+    // `country_detect::SHUTDOWN_GRACE` for why this grace exists.
+    rt.shutdown_timeout(pacrank::country_detect::SHUTDOWN_GRACE);
     result
 }
 
@@ -456,7 +482,7 @@ async fn discover_best_mirrors_impl(
     let client = build_client(resolver.clone());
     let mirrors = fetch_and_filter_mirrors(&client, countries).await?;
     let mirrors = resolve_phase(&resolver, mirrors).await?;
-    let mirrors = latency_phase(&client, mirrors, Duration::from_secs(3)).await;
+    let mirrors = latency_phase(&client, mirrors, LATENCY_PHASE_DURATION).await;
     let mirrors = compute_and_filter_pings(mirrors, ping_k)?;
     let mirrors = throughput_phase(&client, mirrors).await;
     let mirrors = rank_by_throughput(mirrors, dl_k)?;
@@ -587,7 +613,7 @@ async fn latency_phase(
             pacrank::ping_test::ping_url(
                 client,
                 mirror_data.last_sync_url.clone(),
-                Duration::from_secs(1),
+                PROBE_INTERVAL,
                 deadline,
                 // No adaptive cap here: all streams run concurrently under
                 // one fixed deadline, so a hung request holds no scarce slot
@@ -653,8 +679,9 @@ fn compute_and_filter_pings(
             }
             continue;
         };
-        // Anything slower than 1s median is not worth the download test.
-        if computed.ping_stat.median() <= Duration::from_secs(1) {
+        // Anything slower than the acceptable median is not worth the
+        // download test.
+        if computed.ping_stat.median() <= MAX_ACCEPTABLE_MEDIAN {
             kept.push(computed);
         }
     }
