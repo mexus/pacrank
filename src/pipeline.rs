@@ -104,15 +104,24 @@ impl MirrorData<PingStatRunning> {
     /// Finalizes the ping statistics and transitions to the post-latency
     /// phase, or `None` when the mirror produced no warm samples to compute
     /// statistics over.
+    ///
+    /// Consumes `self`: the phase transition moves the per-mirror fields
+    /// (URL, bookkeeping) along instead of cloning them per mirror.
     pub fn compute_pings<R: ?Sized + Rng>(
-        &self,
+        self,
         rng: &mut R,
     ) -> Option<MirrorData<PingStatComputed>> {
+        let Self {
+            mirror,
+            last_sync_url,
+            ping_stat,
+            dl_speed,
+        } = self;
         Some(MirrorData {
-            mirror: self.mirror.clone(),
-            last_sync_url: self.last_sync_url.clone(),
-            ping_stat: self.ping_stat.compute(rng)?,
-            dl_speed: self.dl_speed,
+            mirror,
+            last_sync_url,
+            ping_stat: ping_stat.compute(rng)?,
+            dl_speed,
         })
     }
 }
@@ -307,22 +316,28 @@ pub fn compute_and_filter_pings(
     // alternative is to fall back to the setup sample for such mirrors.
     let mut setup_only = 0usize;
     let mut kept = Vec::new();
-    for data in &mirrors {
+    for data in mirrors {
+        // Diagnosed before `compute_pings`, which consumes `data`: a mirror
+        // whose only success was the cold probe is dropped outright rather
+        // than judged by its handshake sample. The count below is a
+        // provisional metric watching that policy's cost: if it stays high,
+        // the alternative is to fall back to the setup sample for such
+        // mirrors.
+        if data.ping_stat.is_setup_only() {
+            setup_only += 1;
+            let setup = data
+                .ping_stat
+                .setup()
+                .expect("setup-only implies a setup sample");
+            tracing::debug!(
+                "{}: dropped as setup-only, setup = {setup:.2?}",
+                data.mirror.url
+            );
+            continue;
+        }
         let Some(computed) = data.compute_pings(&mut rng) else {
-            // `compute_pings` returned `None`, so there are no warm samples;
-            // `is_setup_only` is what makes this the setup-only case rather
-            // than a fully dead mirror.
-            if data.ping_stat.is_setup_only() {
-                setup_only += 1;
-                let setup = data
-                    .ping_stat
-                    .setup()
-                    .expect("setup-only implies a setup sample");
-                tracing::debug!(
-                    "{}: dropped as setup-only, setup = {setup:.2?}",
-                    data.mirror.url
-                );
-            }
+            // No warm samples and no setup sample: a fully dead mirror, not
+            // worth a log line of its own.
             continue;
         };
         // Anything slower than the acceptable median is not worth the
