@@ -97,20 +97,6 @@ const CDN_SUSPECT_RATIO: u32 = 5;
 /// verdict is worth making under 100ms of setup.
 const CDN_SUSPECT_SETUP_FLOOR: Duration = Duration::from_millis(100);
 
-/// How long a runtime shutdown is allowed to wait for stragglers.
-///
-/// Dropping a Tokio runtime blocks until every *running* `spawn_blocking` task
-/// returns. This is not a transitional workaround: on the system-resolver path
-/// — Android, or any host without a usable `/etc/resolv.conf` — `getaddrinfo`
-/// runs on that pool and cannot be cancelled, so an abandoned lookup keeps
-/// polling the DNS socket for up to ~102s after [`crate::dns::LOOKUP_TIMEOUT`]
-/// said we stopped caring. Cap the wait; the stragglers die with the process.
-///
-/// `pub` for now only because the binary's runtime teardown references it;
-/// once the pipeline moves into the library (refactoring plan T1.1) this can
-/// be `pub(crate)` — its final home is T1.2's move next to the DNS code.
-pub const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
-
 /// Cached countries are considered fresh for this long even when the public
 /// IP /16 still matches; after this we re-detect to catch shifts in the
 /// mirror network (mirrors going dark, new ones coming online).
@@ -229,8 +215,8 @@ pub fn resolve(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectError> {
         .build()
         .context(BuildRuntimeSnafu)?;
     let result = rt.block_on(resolve_async(opts));
-    // Never a plain `drop(rt)` — see `SHUTDOWN_GRACE`.
-    rt.shutdown_timeout(SHUTDOWN_GRACE);
+    // Never a plain `drop(rt)` — see `dns::SHUTDOWN_GRACE`.
+    rt.shutdown_timeout(crate::dns::SHUTDOWN_GRACE);
     result
 }
 

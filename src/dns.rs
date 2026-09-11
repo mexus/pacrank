@@ -40,6 +40,19 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// better while keeping the far-but-valid names.
 pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a runtime shutdown is allowed to wait for stragglers.
+///
+/// Dropping a Tokio runtime blocks until every *running* `spawn_blocking` task
+/// returns. This is not a transitional workaround: on the system-resolver path
+/// — Android, or any host without a usable `/etc/resolv.conf` — `getaddrinfo`
+/// runs on that pool and cannot be cancelled, so an abandoned lookup keeps
+/// polling the DNS socket for up to ~102s after [`LOOKUP_TIMEOUT`] said we
+/// stopped caring. Cap the wait; the stragglers die with the process.
+///
+/// Both runtimes in this crate honor it: the survey's and the discovery
+/// pipeline's.
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+
 /// How many times one name may be looked up before it is dropped.
 ///
 /// Only failures that [`Cause::retryable`] accepts consume an attempt beyond

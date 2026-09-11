@@ -4,8 +4,10 @@
 //! fetching the official mirrors list from archlinux.org, measuring latency
 //! by repeatedly issuing `HEAD` requests against each mirror's `lastsync`
 //! file, and downloading the largest package from the `core` repository to
-//! estimate throughput. The binary entry point (`main.rs`) wires these
-//! pieces together and rewrites `/etc/pacman.d/mirrorlist` with the results.
+//! estimate throughput. The [`pipeline`] module composes them into the
+//! ranked end-to-end run, and the binary entry point (`main.rs`) adds the
+//! process plumbing around it — privilege escalation, the worker protocol,
+//! and the `/etc/pacman.d/mirrorlist` rewrite.
 
 /// Parser for pacman's per-package `desc` metadata.
 pub mod arch_desc;
@@ -25,6 +27,9 @@ pub mod ping_stat;
 /// Repeated latency probing against an HTTP endpoint, plus a self-tuning
 /// cap for cold probes.
 pub mod ping_test;
+/// The end-to-end discovery pipeline: fetch → filter → resolve → latency →
+/// throughput → rank.
+pub mod pipeline;
 
 pub use mirrors::{CountryCode, Mirror, Mirrors};
 
