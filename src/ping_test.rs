@@ -353,7 +353,7 @@ mod test {
     /// Jittering a known duration keeps it within ±[`JITTER_FRACTION`],
     /// across many draws of the seeded RNG.
     #[test]
-    fn test_jitter_stays_within_bounds() {
+    fn jitter_stays_within_bounds() {
         let base = Duration::from_millis(1000);
 
         let min_bound = Duration::from_millis(900);
@@ -373,7 +373,7 @@ mod test {
     }
 
     #[test]
-    fn test_zero_duration_remains_zero() {
+    fn zero_duration_remains_zero() {
         let mut rng = mock_rng();
         let base = Duration::ZERO;
 
@@ -382,16 +382,33 @@ mod test {
         assert_eq!(result, Duration::ZERO);
     }
 
+    /// An RNG whose every draw lands on the top of its range, so the jitter
+    /// always runs *upward* — the direction that overflows near
+    /// `Duration::MAX` and used to panic before the clamp existed.
+    struct MaxRng;
+
+    impl rand::rand_core::TryRng for MaxRng {
+        type Error = core::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(u32::MAX)
+        }
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(u64::MAX)
+        }
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            dst.fill(u8::MAX);
+            Ok(())
+        }
+    }
+
     #[test]
-    fn test_max_duration_safely_clamps_without_panicking() {
-        let mut rng = mock_rng();
-        let base = Duration::MAX;
-
-        // Jittering Duration::MAX upward overflows f64's bounds for Duration.
-        // This ensures the upper-bound check successfully catches it.
-        let result = jitter_duration(base, &mut rng);
-
-        assert!(result <= Duration::MAX);
+    fn max_duration_clamps_exactly() {
+        let mut rng = MaxRng;
+        // With the draw pinned to the top of the range, the clamp is the
+        // only thing standing between +10% of `Duration::MAX` and a panic
+        // in `from_secs_f64` — and it must yield exactly MAX.
+        assert_eq!(jitter_duration(Duration::MAX, &mut rng), Duration::MAX);
     }
 
     /// Serves every request on every connection with `status_line`, e.g.
@@ -418,6 +435,33 @@ mod test {
                                     break;
                                 }
                             }
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Accepts connections and never answers — the stall shape the
+    /// deadline cap exists for. The connection stays parked open so only
+    /// the client's own timeout can end the exchange.
+    async fn spawn_silent_server() -> std::net::SocketAddr {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    // Drain whatever the client sends, forever unanswered.
+                    loop {
+                        if sock.read(&mut buf).await.is_err() {
+                            break;
                         }
                     }
                 });
@@ -472,6 +516,39 @@ mod test {
         assert!(probes.len() >= 2, "expected several probes, got {probes:?}");
         assert!(probes[0].cold);
         assert!(probes[1..].iter().all(|p| !p.cold));
+    }
+
+    /// A server that accepts but never answers produces a `TimedOut`, not a
+    /// hang and not an `Http` — the cancellation path `PingError::TimedOut`
+    /// exists to carry. The adaptive cold cap keeps the wait short so the
+    /// test measures the variant, not the grace.
+    #[tokio::test]
+    async fn a_stalled_server_times_out() {
+        let addr = spawn_silent_server().await;
+        let client = reqwest::Client::new();
+        let url: url::Url = format!("http://{addr}/lastsync").parse().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let cap = AdaptiveTimeout::new(Duration::from_millis(80), Duration::from_millis(10));
+        let stream = ping_url(
+            &client,
+            url,
+            Duration::from_secs(1),
+            deadline,
+            Some(cap),
+            CacheBust::Off,
+        );
+        futures_util::pin_mut!(stream);
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            futures_util::StreamExt::next(&mut stream),
+        )
+        .await
+        .expect("the deadline cap must cut a stalled server off")
+        .expect("the first probe fires immediately");
+        assert!(
+            matches!(first, Err(PingError::TimedOut { .. })),
+            "a stalled server is a cancellation, got {first:?}"
+        );
     }
 
     #[test]
