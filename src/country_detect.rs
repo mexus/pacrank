@@ -22,7 +22,7 @@ use snafu::{ResultExt, Snafu};
 use time::OffsetDateTime;
 
 use crate::{
-    APP_USER_AGENT, CountryCode, Mirrors,
+    CountryCode, Mirrors,
     dns::SurveyResolver,
     ping_test::{AdaptiveTimeout, CacheBust},
 };
@@ -224,13 +224,7 @@ async fn resolve_async(opts: DetectOptions) -> Result<Vec<CountryCode>, DetectEr
     // The survey warms this resolver ahead of the pings; handing the same
     // instance to reqwest is what turns those warm-ups into cache hits.
     let resolver = SurveyResolver::new();
-    let client = reqwest::Client::builder()
-        .user_agent(APP_USER_AGENT)
-        .connect_timeout(Duration::from_secs(2))
-        .tls_certs_only(crate::tls_roots())
-        .dns_resolver(resolver.clone())
-        .build()
-        .context(BuildClientSnafu)?;
+    let client = crate::build_client(resolver.clone()).context(BuildClientSnafu)?;
 
     let cache_file = if opts.read_cache || opts.write_cache {
         cache_path()

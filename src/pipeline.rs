@@ -20,7 +20,7 @@ use time::OffsetDateTime;
 use url::Url;
 
 use crate::{
-    APP_USER_AGENT, CountryCode, Mirror, Mirrors,
+    CountryCode, Mirror, Mirrors,
     ping_stat::{PingStatComputed, PingStatRunning},
 };
 
@@ -144,10 +144,11 @@ pub async fn discover_best_mirrors_impl(
     ping_k: NonZeroUsize,
     countries: &[CountryCode],
 ) -> Result<Vec<Url>, snafu::Whatever> {
-    // Kept out of `build_client` so the resolve phase can warm the very
-    // cache the client will later read from.
+    // Kept out of the client (see `crate::build_client`) so the resolve
+    // phase can warm the very cache the client will later read from.
     let resolver = crate::dns::SurveyResolver::new();
-    let client = build_client(resolver.clone());
+    let client =
+        crate::build_client(resolver.clone()).whatever_context("Can't build the HTTP client")?;
     let mirrors = fetch_and_filter_mirrors(&client, countries).await?;
     let mirrors = resolve_phase(&resolver, mirrors).await?;
     let mirrors = latency_phase(&client, mirrors, LATENCY_PHASE_DURATION).await;
@@ -156,19 +157,6 @@ pub async fn discover_best_mirrors_impl(
     let mirrors = rank_by_throughput(mirrors, dl_k)?;
     print_summary(&mirrors);
     Ok(mirrors.into_iter().map(|data| data.mirror.url).collect())
-}
-
-/// Single shared client for the whole pipeline: one connection pool, one UA,
-/// one connect timeout. HTTP keep-alive across `core.db` → largest-package
-/// downloads to the same mirror is a nice side effect.
-pub fn build_client(resolver: crate::dns::SurveyResolver) -> reqwest::Client {
-    reqwest::Client::builder()
-        .user_agent(APP_USER_AGENT)
-        .connect_timeout(Duration::from_secs(2))
-        .tls_certs_only(crate::tls_roots())
-        .dns_resolver(resolver)
-        .build()
-        .expect("Should be OK")
 }
 
 /// Phase 1: downloads the official mirrors list and filters it down to

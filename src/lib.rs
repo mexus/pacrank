@@ -9,6 +9,8 @@
 //! process plumbing around it — privilege escalation, the worker protocol,
 //! and the `/etc/pacman.d/mirrorlist` rewrite.
 
+use std::time::Duration;
+
 /// Parser for pacman's per-package `desc` metadata.
 pub mod arch_desc;
 /// Auto-detect the user's nearest country (or top-K nearest countries) by
@@ -68,4 +70,24 @@ pub fn tls_roots() -> Vec<reqwest::Certificate> {
         .iter()
         .map(|der| reqwest::Certificate::from_der(der).expect("bundled webpki roots are valid DER"))
         .collect()
+}
+
+/// The shared HTTP client every network stage is built on: one UA, one
+/// connect timeout, the bundled webpki roots, and the survey resolver's
+/// cache.
+///
+/// Both the country survey and the discovery pipeline construct their
+/// client here so the two stages make identical requests — same
+/// `User-Agent` (see [`APP_USER_AGENT`] for why that exact string), same
+/// 2s connect timeout, same root store — and share the resolver cache
+/// that keeps DNS time out of every measurement.
+pub fn build_client(
+    resolver: crate::dns::SurveyResolver,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .user_agent(APP_USER_AGENT)
+        .connect_timeout(Duration::from_secs(2))
+        .tls_certs_only(tls_roots())
+        .dns_resolver(resolver)
+        .build()
 }
