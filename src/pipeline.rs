@@ -53,7 +53,7 @@ pub fn discover_best_mirrors(
         .enable_all()
         .build()
         .whatever_context("Can't initialize Tokio")?;
-    let result = rt.block_on(discover_best_mirrors_impl(dl_k, ping_k, countries));
+    let result = rt.block_on(discover_best_mirrors_async(dl_k, ping_k, countries));
     // Never a plain `drop(rt)`: it would block until every abandoned
     // `getaddrinfo` blocking task returns. See `dns::SHUTDOWN_GRACE` for
     // why this grace exists.
@@ -71,7 +71,7 @@ pub fn discover_best_mirrors(
 ///   will fail to produce a number), bare `f64` after ranking has filtered
 ///   out the failures; the latter makes "has a measured speed" a
 ///   compile-time guarantee.
-pub struct MirrorData<PING = PingStatRunning, DL = Option<f64>> {
+pub(crate) struct MirrorData<PING = PingStatRunning, DL = Option<f64>> {
     mirror: Mirror,
     /// Pre-built `lastsync` URL — that endpoint is cheap to HEAD and avoids
     /// hammering a real package while measuring latency.
@@ -89,7 +89,7 @@ impl MirrorData<PingStatRunning> {
     ///
     /// Fails if the mirror's URL can't accept the `lastsync` path suffix
     /// (shouldn't happen for well-formed archlinux.org entries).
-    pub fn try_new(mirror: Mirror) -> Result<Self, snafu::Whatever> {
+    pub(crate) fn try_new(mirror: Mirror) -> Result<Self, snafu::Whatever> {
         let last_sync_url = mirror
             .lastsync_url()
             .whatever_context("Can't build the lastsync url")?;
@@ -107,7 +107,7 @@ impl MirrorData<PingStatRunning> {
     ///
     /// Consumes `self`: the phase transition moves the per-mirror fields
     /// (URL, bookkeeping) along instead of cloning them per mirror.
-    pub fn compute_pings(self) -> Option<MirrorData<PingStatComputed>> {
+    pub(crate) fn compute_pings(self) -> Option<MirrorData<PingStatComputed>> {
         let Self {
             mirror,
             last_sync_url,
@@ -130,7 +130,7 @@ impl MirrorData<PingStatComputed, Option<f64>> {
     /// Shaped for use as an [`Iterator::filter_map`] predicate — the `None`
     /// return filters the mirror out, the `Some(_)` threads it forward with
     /// `dl_speed: f64`.
-    pub fn into_measured(self) -> Option<MirrorData<PingStatComputed, f64>> {
+    pub(crate) fn into_measured(self) -> Option<MirrorData<PingStatComputed, f64>> {
         Some(MirrorData {
             mirror: self.mirror,
             last_sync_url: self.last_sync_url,
@@ -143,7 +143,7 @@ impl MirrorData<PingStatComputed, Option<f64>> {
 /// The full discovery pipeline: fetch → filter → latency → throughput → rank.
 ///
 /// Reads top-to-bottom as a recipe; each phase lives in its own function.
-pub async fn discover_best_mirrors_impl(
+async fn discover_best_mirrors_async(
     dl_k: NonZeroUsize,
     ping_k: NonZeroUsize,
     countries: &[CountryCode],
@@ -165,7 +165,7 @@ pub async fn discover_best_mirrors_impl(
 
 /// Phase 1: downloads the official mirrors list and filters it down to
 /// HTTP(S) mirrors in any of `countries` whose last sync is within 48h.
-pub async fn fetch_and_filter_mirrors(
+pub(crate) async fn fetch_and_filter_mirrors(
     client: &reqwest::Client,
     countries: &[CountryCode],
 ) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
@@ -225,7 +225,7 @@ pub async fn fetch_and_filter_mirrors(
 /// burn its own lookup and, when the resolver is already struggling, its
 /// own retry ladder. One lookup per name is also one verdict per name:
 /// twins can no longer diverge over whether their host resolves.
-pub async fn resolve_phase(
+pub(crate) async fn resolve_phase(
     resolver: &crate::dns::SurveyResolver,
     mirrors: Vec<MirrorData<PingStatRunning>>,
 ) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
@@ -270,7 +270,7 @@ pub async fn resolve_phase(
 
 /// Phase 2a: probes every mirror's `lastsync` URL for `duration`, recording
 /// per-probe latency (or errors) into each mirror's [`PingStatRunning`].
-pub async fn latency_phase(
+pub(crate) async fn latency_phase(
     client: &reqwest::Client,
     mut mirrors: Vec<MirrorData<PingStatRunning>>,
     duration: Duration,
@@ -331,7 +331,7 @@ pub async fn latency_phase(
 
 /// Phase 2b: turns raw ping samples into summary statistics, drops anything
 /// slower than a 1s mean, then keeps the `ping_k` fastest survivors.
-pub fn compute_and_filter_pings(
+pub(crate) fn compute_and_filter_pings(
     mirrors: Vec<MirrorData<PingStatRunning>>,
     ping_k: NonZeroUsize,
 ) -> Result<Vec<MirrorData<PingStatComputed>>, snafu::Whatever> {
@@ -395,7 +395,7 @@ pub fn compute_and_filter_pings(
 ///
 /// Running concurrent downloads would split local bandwidth between them
 /// and distort the per-mirror measurement; that's why we don't parallelize.
-pub async fn throughput_phase(
+pub(crate) async fn throughput_phase(
     client: &reqwest::Client,
     mut mirrors: Vec<MirrorData<PingStatComputed>>,
 ) -> Vec<MirrorData<PingStatComputed>> {
@@ -431,7 +431,7 @@ pub async fn throughput_phase(
 
 /// Phase 3b: drops mirrors whose download failed, ranks the rest fastest
 /// first, and keeps the top `dl_k`.
-pub fn rank_by_throughput(
+pub(crate) fn rank_by_throughput(
     mirrors: Vec<MirrorData<PingStatComputed>>,
     dl_k: NonZeroUsize,
 ) -> Result<Vec<MirrorData<PingStatComputed, f64>>, snafu::Whatever> {
@@ -447,7 +447,7 @@ pub fn rank_by_throughput(
 }
 
 /// Prints a one-per-mirror summary of the ranked survivors to stderr.
-pub fn print_summary(mirrors: &[MirrorData<PingStatComputed, f64>]) {
+pub(crate) fn print_summary(mirrors: &[MirrorData<PingStatComputed, f64>]) {
     for data in mirrors {
         eprintln!(
             "{}:\n  * DL speed: {}\n  * TTFB: {:.2?}",
@@ -464,7 +464,7 @@ pub fn print_summary(mirrors: &[MirrorData<PingStatComputed, f64>]) {
 /// [`crate::largest_file_discovery::discover`] — which itself downloads and
 /// parses `core.db` — then downloads that package for up to two seconds and
 /// returns the observed bytes-per-second.
-pub async fn dl_mirror<T>(
+pub(crate) async fn dl_mirror<T>(
     client: &reqwest::Client,
     mirror_data: &MirrorData<T>,
     dl_progress: &ProgressBar,
