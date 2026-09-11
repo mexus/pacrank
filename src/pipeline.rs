@@ -155,7 +155,7 @@ async fn discover_best_mirrors_async(
         crate::build_client(resolver.clone()).whatever_context("Can't build the HTTP client")?;
     let mirrors = fetch_and_filter_mirrors(&client, countries).await?;
     let mirrors = resolve_phase(&resolver, mirrors).await?;
-    let mirrors = latency_phase(&client, mirrors, LATENCY_PHASE_DURATION).await;
+    let mirrors = latency_phase(&client, mirrors).await;
     let mirrors = compute_and_filter_pings(mirrors, ping_k)?;
     let mirrors = throughput_phase(&client, mirrors).await;
     let mirrors = rank_by_throughput(mirrors, dl_k)?;
@@ -268,12 +268,12 @@ pub(crate) async fn resolve_phase(
     Ok(mirrors)
 }
 
-/// Phase 2a: probes every mirror's `lastsync` URL for `duration`, recording
-/// per-probe latency (or errors) into each mirror's [`PingStatRunning`].
+/// Phase 2a: probes every mirror's `lastsync` URL for
+/// [`LATENCY_PHASE_DURATION`], recording per-probe latency (or errors)
+/// into each mirror's [`PingStatRunning`].
 pub(crate) async fn latency_phase(
     client: &reqwest::Client,
     mut mirrors: Vec<MirrorData<PingStatRunning>>,
-    duration: Duration,
 ) -> Vec<MirrorData<PingStatRunning>> {
     // Deadline shared by every ping stream and by each individual request
     // (see `ping_url` for the per-request timeout).
@@ -285,7 +285,7 @@ pub(crate) async fn latency_phase(
     // pollutes the setup figures; if those ever start to matter, stagger the
     // first probes across `[0, interval)` — that spreads the burst without
     // costing wall time.
-    let deadline = Instant::now() + duration;
+    let deadline = Instant::now() + LATENCY_PHASE_DURATION;
     let streams = mirrors
         .iter()
         .enumerate()
