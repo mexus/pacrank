@@ -171,26 +171,37 @@ pub async fn fetch_and_filter_mirrors(
 ) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
     let Mirrors::V3(mirrors) = crate::mirrors::fetch(client)
         .await
-        .whatever_context("Can't fetch the mirrors list")?;
+        .whatever_context("Can't fetch or parse the mirrors list")?;
     tracing::info!("Fetched {} mirrors", mirrors.urls.len());
 
     // The freshness/protocol gate both stages share: see
-    // `Mirror::is_fresh`.
-    let kept = mirrors
-        .urls
-        .into_iter()
-        .filter_map(|mirror| {
-            if mirror.is_fresh()
-                && countries.contains(&mirror.country_code)
-                && let Ok(mirror_data) = MirrorData::try_new(mirror)
-            {
-                Some(mirror_data)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+    // `Mirror::is_fresh`. A mirror dropped by it is expected — the list
+    // carries stale, non-HTTP and out-of-country entries by design — but a
+    // mirror dropped because its lastsync URL cannot be built is a surprise
+    // worth a log line, exactly like the parse failures lenient_mirrors
+    // reports.
+    let mut unbuildable = 0usize;
+    let mut kept = Vec::new();
+    for mirror in mirrors.urls {
+        if !mirror.is_fresh() || !countries.contains(&mirror.country_code) {
+            continue;
+        }
+        // Checked before `try_new` consumes the mirror, so the warning can
+        // name the culprit; the join is cheap enough to run twice.
+        if let Err(e) = mirror.lastsync_url() {
+            unbuildable += 1;
+            tracing::warn!("Dropping {}: {e}", mirror.url);
+            continue;
+        }
+        // Cannot fail now that the join is known to succeed.
+        if let Ok(mirror_data) = MirrorData::try_new(mirror) {
+            kept.push(mirror_data);
+        }
+    }
     snafu::ensure_whatever!(!kept.is_empty(), "No mirrors available");
+    if unbuildable > 0 {
+        tracing::info!("{unbuildable} mirrors dropped: their lastsync URL could not be built.");
+    }
     tracing::info!(
         "Discovered {} mirrors for {}",
         kept.len(),
