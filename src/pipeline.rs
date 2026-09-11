@@ -546,8 +546,11 @@ mod test {
         data
     }
 
-    /// The same entry after `compute_pings` — with uniform warm samples the
-    /// mean is the sample value, so callers can assert exact latencies.
+    /// The same entry after `compute_pings`. Every sample set has an exact
+    /// rational mean, so callers assert exact latencies — and deliberately
+    /// non-uniform ones, where the mean differs from any single sample and
+    /// from the upper median, so a regression to either is visible here
+    /// rather than only in ping_stat's own unit tests.
     fn computed(n: usize, warm_ms: &[u64]) -> MirrorData<PingStatComputed> {
         running(n, warm_ms, Some(50))
             .compute_pings()
@@ -562,8 +565,10 @@ mod test {
     /// not judged by its handshake sample.
     #[test]
     fn setup_only_mirrors_are_dropped() {
+        // Non-uniform warm samples: the mean (110) is neither sample and
+        // not the upper median (130), so the assertion pins the estimator.
         let mirrors = vec![
-            running(0, &[100, 110, 120], Some(900)),
+            running(0, &[90, 130], Some(900)),
             running(1, &[], Some(400)),
         ];
         let kept = compute_and_filter_pings(mirrors, ping_k(10)).unwrap();
@@ -577,34 +582,80 @@ mod test {
     }
 
     /// A mean above `MAX_ACCEPTABLE_MEAN` disqualifies the mirror from the
-    /// throughput phase.
+    /// throughput phase — with a fast sibling present, so the assertion
+    /// observes the cutoff specifically rather than the empty-survivor
+    /// error it would otherwise collapse into.
     #[test]
     fn slow_means_are_dropped() {
-        let mirrors = vec![running(0, &[1500, 1500], Some(400))];
-        assert!(compute_and_filter_pings(mirrors, ping_k(10)).is_err());
+        let mirrors = vec![
+            running(0, &[90, 130], Some(400)),
+            running(1, &[1800, 2200], Some(400)),
+        ];
+        let kept = compute_and_filter_pings(mirrors, ping_k(10)).unwrap();
+        assert_eq!(kept.len(), 1, "only the fast mirror survives");
+        assert_eq!(
+            kept[0].mirror.url.as_str(),
+            "https://mirror-0.example.com/archlinux/"
+        );
     }
 
-    /// `ping_k` keeps the fastest survivors, sorted by mean ascending.
+    /// The cutoff is inclusive (`<=`): a mirror whose mean is exactly the
+    /// 1s bound is measured, not dropped.
+    #[test]
+    fn a_mirror_exactly_at_the_mean_cutoff_is_kept() {
+        let mirrors = vec![running(0, &[900, 1100], Some(400))];
+        let kept = compute_and_filter_pings(mirrors, ping_k(10)).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].ping_stat.mean(), MAX_ACCEPTABLE_MEAN);
+    }
+
+    /// `ping_k` keeps the fastest survivors, sorted by mean ascending — and
+    /// equal means keep input order (stable sort).
     #[test]
     fn ping_k_truncates_to_the_fastest_in_mean_order() {
         let mirrors = vec![
-            running(0, &[300, 300], Some(400)),
-            running(1, &[100, 100], Some(400)),
-            running(2, &[200, 200], Some(400)),
+            running(0, &[300, 400], Some(400)),
+            running(1, &[100, 120], Some(400)),
+            running(2, &[200, 240], Some(400)),
         ];
         let kept = compute_and_filter_pings(mirrors, ping_k(2)).unwrap();
         let means: Vec<Duration> = kept.iter().map(|m| m.ping_stat.mean()).collect();
         assert_eq!(
             means,
-            [Duration::from_millis(100), Duration::from_millis(200)]
+            [Duration::from_millis(110), Duration::from_millis(220)]
         );
     }
 
-    /// No warm samples anywhere means nothing to continue with.
+    /// Two mirrors with identical means: `ping_k` keeping one of them must
+    /// keep the earlier one — the stable-sort half of the ordering
+    /// contract, previously pinned only on the throughput side.
+    #[test]
+    fn equal_means_keep_input_order_under_truncation() {
+        let mirrors = vec![
+            running(0, &[100, 120], Some(400)),
+            running(1, &[90, 130], Some(400)),
+        ];
+        let kept = compute_and_filter_pings(mirrors, ping_k(1)).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].mirror.url.as_str(),
+            "https://mirror-0.example.com/archlinux/",
+            "both means are 110ms; the first input must win"
+        );
+    }
+
+    /// No warm samples anywhere means nothing to continue with — and the
+    /// error says so in the phase's own words.
     #[test]
     fn all_setup_only_is_an_error() {
         let mirrors = vec![running(0, &[], Some(400)), running(1, &[], None)];
-        assert!(compute_and_filter_pings(mirrors, ping_k(10)).is_err());
+        let err = compute_and_filter_pings(mirrors, ping_k(10))
+            .err()
+            .expect("no survivors must be an error");
+        assert!(
+            err.to_string().contains("No servers to continue with"),
+            "diagnostic text is user-facing: {err}"
+        );
     }
 
     /// Mirrors that failed the download measurement are filtered, not
@@ -665,13 +716,19 @@ mod test {
     }
 
     /// Every download having failed means nothing to write to the
-    /// mirrorlist.
+    /// mirrorlist — in the phase's own words.
     #[test]
     fn all_unmeasured_is_an_error() {
         let mut a = computed(0, &[100, 100]);
         a.dl_speed = None;
         let mut b = computed(1, &[200, 200]);
         b.dl_speed = None;
-        assert!(rank_by_throughput(vec![a, b], ping_k(10)).is_err());
+        let err = rank_by_throughput(vec![a, b], ping_k(10))
+            .err()
+            .expect("no measured mirrors must be an error");
+        assert!(
+            err.to_string().contains("No servers to continue with"),
+            "diagnostic text is user-facing: {err}"
+        );
     }
 }
