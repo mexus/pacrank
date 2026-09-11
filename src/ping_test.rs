@@ -10,6 +10,7 @@ use display_error_chain::DisplayErrorChain;
 use futures_util::Stream;
 use rand::{Rng, RngExt};
 use reqwest::IntoUrl;
+use snafu::Snafu;
 
 /// Fraction of a probe interval used as random jitter, as in "±10%".
 ///
@@ -205,6 +206,24 @@ async fn time_to_first_byte_once<T: IntoUrl>(
     Ok(start.elapsed())
 }
 
+/// Why a single probe out of [`ping_url`] produced no sample.
+///
+/// The variants carry the underlying errors so the structure survives the
+/// library boundary instead of collapsing into a pre-formatted string; the
+/// `Display` output is the full error chain either way, because logging is
+/// all the consumers ever do with it.
+#[derive(Debug, Snafu)]
+pub enum PingError {
+    /// The HEAD request failed, or answered a non-2xx status — see
+    /// `time_to_first_byte_once` for why the status check is load-bearing.
+    #[snafu(display("{}", DisplayErrorChain::new(&source)))]
+    Http { source: reqwest::Error },
+    /// The request was cut off at the phase deadline (plus grace) or by the
+    /// adaptive setup cap — cancellation, not a server answer.
+    #[snafu(display("{source}"))]
+    TimedOut { source: tokio::time::error::Elapsed },
+}
+
 /// Repeatedly probes `url` with `HEAD` requests and yields each probe's
 /// latency, tagged cold or warm — see [`Probe::cold`].
 ///
@@ -233,7 +252,7 @@ pub fn ping_url(
     until: Instant,
     setup_timeout: Option<AdaptiveTimeout>,
     cache_bust: CacheBust,
-) -> impl Stream<Item = Result<Probe, String>> {
+) -> impl Stream<Item = Result<Probe, PingError>> {
     // OS-seeded: we only use it for timing jitter and cache-busting nonces,
     // not anything reproducible.
     let mut rng: rand::rngs::StdRng = rand::make_rng();
@@ -288,12 +307,12 @@ pub fn ping_url(
                         // does not feed the timeout. It also leaves no pooled
                         // connection behind, so the next success is still the
                         // cold one.
-                        Ok(Err(e)) => Err(DisplayErrorChain::new(e).to_string()),
+                        Ok(Err(e)) => Err(PingError::Http { source: e }),
                         Err(elapsed) => {
                             if let Some(timeout) = &setup_timeout {
                                 timeout.observe_timeout();
                             }
-                            Err(DisplayErrorChain::new(elapsed).to_string())
+                            Err(PingError::TimedOut { source: elapsed })
                         }
                     };
 
@@ -407,7 +426,7 @@ mod test {
         addr
     }
 
-    async fn collect_probes(addr: std::net::SocketAddr) -> Vec<Result<Probe, String>> {
+    async fn collect_probes(addr: std::net::SocketAddr) -> Vec<Result<Probe, PingError>> {
         let client = reqwest::Client::new();
         let url: url::Url = format!("http://{addr}/lastsync").parse().unwrap();
         let deadline = Instant::now() + Duration::from_millis(250);
@@ -435,7 +454,10 @@ mod test {
         let probes = collect_probes(addr).await;
         assert!(!probes.is_empty());
         for probe in probes {
-            assert!(probe.is_err(), "403 must not produce a latency sample");
+            assert!(
+                matches!(probe, Err(PingError::Http { .. })),
+                "403 must not produce a latency sample: {probe:?}"
+            );
         }
     }
 

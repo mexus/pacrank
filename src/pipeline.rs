@@ -293,7 +293,7 @@ pub async fn latency_phase(
                 mirror_data.ping_stat.record_ping(probe);
             }
             Err(err) => {
-                tracing::debug!("{}: {err:?}", mirror_data.mirror.url);
+                tracing::debug!("{}: {err}", mirror_data.mirror.url);
             }
         }
     }
