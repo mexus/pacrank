@@ -83,10 +83,24 @@ impl PingStatRunning {
         self.setup
     }
 
+    /// The warm samples recorded so far, in arrival order.
+    pub fn warm(&self) -> &[Duration] {
+        &self.warm
+    }
+
     /// Whether the only success was the cold probe — the mirror answered
     /// once, paid the handshake, and never produced a warm sample.
     pub fn is_setup_only(&self) -> bool {
         self.setup.is_some() && self.warm.is_empty()
+    }
+
+    /// Median of the warm samples (upper median for even counts), or `None`
+    /// with no warm samples. This is the cheap point estimate the country
+    /// survey ranks by — unlike [`Self::compute`], no bootstrap.
+    pub fn warm_median(&self) -> Option<Duration> {
+        let mut warm = self.warm.clone();
+        warm.sort_unstable();
+        warm.get(warm.len() / 2).copied()
     }
 
     /// Finalizes the running statistics into an immutable [`PingStatComputed`],

@@ -24,6 +24,7 @@ use time::OffsetDateTime;
 use crate::{
     CountryCode, Mirrors,
     dns::SurveyResolver,
+    ping_stat::PingStatRunning,
     ping_test::{AdaptiveTimeout, CacheBust},
 };
 
@@ -415,27 +416,28 @@ async fn survey(
     let mut results = Vec::new();
     let mut setup_only = 0usize;
     let mut leaders: Vec<(CountryCode, Duration)> = Vec::new();
-    while let Some((country, host, (setup, mut warm))) = pings.next().await {
+    while let Some((country, host, stat)) = pings.next().await {
         leaders_bar.inc(1);
-        if warm.is_empty() {
-            // Same policy as the main pipeline: a mirror whose only answer
-            // was the cold probe is dropped, not judged by its handshake.
-            // Counted so the policy's cost stays visible.
-            if let Some(setup) = setup {
-                setup_only += 1;
-                tracing::debug!(
-                    "{} {host}: dropped as setup-only, setup {setup:.2?}",
-                    country.as_code()
-                );
-            }
+        // Same policy as the main pipeline: a mirror whose only answer
+        // was the cold probe is dropped, not judged by its handshake.
+        // Counted so the policy's cost stays visible.
+        if stat.is_setup_only() {
+            setup_only += 1;
+            let setup = stat.setup().expect("setup-only implies a setup sample");
+            tracing::debug!(
+                "{} {host}: dropped as setup-only, setup {setup:.2?}",
+                country.as_code()
+            );
             continue;
         }
-        warm.sort_unstable();
-        let median = warm[warm.len() / 2];
+        let Some(median) = stat.warm_median() else {
+            // Neither cold nor warm sample answered — a fully dead mirror.
+            continue;
+        };
         // Log-only canary. Cache-busted probes should make a CDN front
         // measure as far, so this firing means some cache answered busted
         // URLs anyway — worth knowing, but the mirror keeps its vote.
-        if let Some(setup) = setup
+        if let Some(setup) = stat.setup()
             && is_cdn_suspect(setup, median)
         {
             tracing::info!(
@@ -448,10 +450,13 @@ async fn survey(
         // The per-mirror record behind a country verdict. Cheap to emit and
         // the only way to tell a genuinely close mirror from a mislabelled or
         // misbehaving one after the fact.
-        let setup = setup.map_or_else(|| "n/a".to_owned(), |s| format!("{s:.2?}"));
+        let setup = stat
+            .setup()
+            .map_or_else(|| "n/a".to_owned(), |s| format!("{s:.2?}"));
         tracing::debug!(
             "{} {host}: median {median:.2?} of {warm:.2?}, setup {setup}",
-            country.as_code()
+            country.as_code(),
+            warm = stat.warm(),
         );
         update_leaders(&mut leaders, country, median);
         leaders_bar.set_message(format_leaders(&leaders));
@@ -481,8 +486,9 @@ async fn survey(
     Ok(results)
 }
 
-/// Probes one mirror for [`SURVEY_BUDGET`] and returns its connection-setup
-/// latency (the cold probe) plus the raw warm samples.
+/// Probes one mirror for [`SURVEY_BUDGET`] and accumulates the samples into
+/// a [`PingStatRunning`] — setup (the cold probe) separate from the warm
+/// ones.
 ///
 /// The name is already in the resolver's cache by the time this runs, so the
 /// cold probe pays connect and TLS but never DNS.
@@ -495,7 +501,7 @@ async fn probe(
     client: &reqwest::Client,
     url: url::Url,
     setup_timeout: AdaptiveTimeout,
-) -> (Option<Duration>, Vec<Duration>) {
+) -> PingStatRunning {
     let deadline = Instant::now() + SURVEY_BUDGET;
     let stream = crate::ping_test::ping_url(
         client,
@@ -506,18 +512,13 @@ async fn probe(
         CacheBust::PerProbe,
     );
     futures_util::pin_mut!(stream);
-    let mut setup = None;
-    let mut warm = Vec::new();
+    let mut stat = PingStatRunning::default();
     while let Some(result) = stream.next().await {
         if let Ok(probe) = result {
-            if probe.cold {
-                setup.get_or_insert(probe.latency);
-            } else {
-                warm.push(probe.latency);
-            }
+            stat.record_ping(probe);
         }
     }
-    (setup, warm)
+    stat
 }
 
 /// Whether a mirror's setup/median relationship betrays a CDN or anycast

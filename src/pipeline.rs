@@ -311,10 +311,14 @@ pub fn compute_and_filter_pings(
     for data in &mirrors {
         let Some(computed) = data.compute_pings(&mut rng) else {
             // `compute_pings` returned `None`, so there are no warm samples;
-            // a recorded setup is what makes this the setup-only case rather
+            // `is_setup_only` is what makes this the setup-only case rather
             // than a fully dead mirror.
-            if let Some(setup) = data.ping_stat.setup() {
+            if data.ping_stat.is_setup_only() {
                 setup_only += 1;
+                let setup = data
+                    .ping_stat
+                    .setup()
+                    .expect("setup-only implies a setup sample");
                 tracing::debug!(
                     "{}: dropped as setup-only, setup = {setup:.2?}",
                     data.mirror.url
