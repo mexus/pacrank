@@ -9,7 +9,7 @@
 //! process plumbing around it — privilege escalation, the worker protocol,
 //! and the `/etc/pacman.d/mirrorlist` rewrite.
 
-use std::time::Duration;
+use std::{sync::LazyLock, time::Duration};
 
 /// Parser for pacman's per-package `desc` metadata.
 pub mod arch_desc;
@@ -54,8 +54,8 @@ pub static APP_USER_AGENT: &str = concat!(
     env!("CARGO_PKG_VERSION"),
 );
 
-/// The bundled Mozilla root certificates, ready to hand to
-/// [`reqwest::ClientBuilder::tls_certs_only`].
+/// The bundled Mozilla root certificates, parsed once per process and handed
+/// to [`reqwest::ClientBuilder::tls_certs_only`].
 ///
 /// reqwest 0.13 verifies server certificates with `rustls-platform-verifier`
 /// by default. On Android that verifier has to be initialized through the JVM,
@@ -65,11 +65,21 @@ pub static APP_USER_AGENT: &str = concat!(
 /// routes verification through webpki instead, sidestepping the platform
 /// verifier entirely and making the binary self-contained on every target we
 /// ship.
-pub fn tls_roots() -> Vec<reqwest::Certificate> {
+///
+/// Parsing the DER blobs into `Certificate`s is pure CPU work over ~150
+/// entries, and every client build in the process wants the exact same set —
+/// so the result is cached in [`TLS_ROOTS`] instead of being rebuilt per call.
+static TLS_ROOTS: LazyLock<Vec<reqwest::Certificate>> = LazyLock::new(|| {
     webpki_root_certs::TLS_SERVER_ROOT_CERTS
         .iter()
         .map(|der| reqwest::Certificate::from_der(der).expect("bundled webpki roots are valid DER"))
         .collect()
+});
+
+/// A clone of the cached root set — a fresh `Vec`, because `tls_certs_only`
+/// consumes its argument by value.
+pub fn tls_roots() -> Vec<reqwest::Certificate> {
+    TLS_ROOTS.clone()
 }
 
 /// The shared HTTP client every network stage is built on: one UA, one
