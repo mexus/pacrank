@@ -82,21 +82,32 @@ pub fn tls_roots() -> Vec<reqwest::Certificate> {
     TLS_ROOTS.clone()
 }
 
+/// How long the shared client waits for a TCP (+ TLS) connection to be
+/// established.
+///
+/// Connects are the cheap end of every request this crate makes, and both
+/// the survey and the pipeline issue them in volume — a mirror that cannot
+/// even complete a handshake within 2s has nothing worth measuring. Waits
+/// *after* the connection (headers, body) are bounded per consumer
+/// instead, where their budget belongs to the measurement being taken.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// The shared HTTP client every network stage is built on: one UA, one
-/// connect timeout, the bundled webpki roots, and the survey resolver's
+/// connect timeout, the bundled webpki roots, and the shared resolver's
 /// cache.
 ///
 /// Both the country survey and the discovery pipeline construct their
 /// client here so the two stages make identical requests — same
 /// `User-Agent` (see [`APP_USER_AGENT`] for why that exact string), same
-/// 2s connect timeout, same root store — and share the resolver cache
-/// that keeps DNS time out of every measurement.
+/// `CONNECT_TIMEOUT`, same root store — and share the resolver cache
+/// that keeps DNS time out of every measurement (the survey warms it
+/// before pinging; the pipeline's resolve phase does the same).
 pub fn build_client(
     resolver: crate::dns::SurveyResolver,
 ) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
-        .connect_timeout(Duration::from_secs(2))
+        .connect_timeout(CONNECT_TIMEOUT)
         .tls_certs_only(tls_roots())
         .dns_resolver(resolver)
         .build()

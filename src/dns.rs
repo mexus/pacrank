@@ -1,13 +1,15 @@
-//! Name resolution for the mirror survey.
+//! Name resolution, shared by the country survey and the discovery
+//! pipeline.
 //!
 //! Three concerns live here that the rest of the crate gets to treat as one:
 //!
 //! * a `Backend` choice — an async resolver where the platform lets us have
 //!   one, the system resolver where it does not;
-//! * a cache that doubles as the hand-off between the survey's resolve stage
-//!   and its ping stage. Warming a name and resolving it on reqwest's behalf
-//!   are the same operation, so the survey never threads addresses through its
-//!   pipeline: it warms a name, and the ping that follows hits the cache.
+//! * a cache that doubles as the hand-off between a stage's resolve step
+//!   and its ping step. Warming a name and resolving it on reqwest's behalf
+//!   are the same operation, so no stage ever threads addresses through its
+//!   pipeline: it warms a name (the survey per fresh mirror, the pipeline
+//!   once per distinct hostname), and the ping that follows hits the cache.
 //! * a reading of what a *failed* lookup meant — see `Cause`. A name the
 //!   resolver answered about negatively is dropped; a resolver that declined
 //!   to answer is simply asked again.
@@ -38,7 +40,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// silently drop real mirrors. What this guards against is the other tail —
 /// `ftp.linux.cz` and two others take ~102s to fail — so 5s is twenty times
 /// better while keeping the far-but-valid names.
-pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a runtime shutdown is allowed to wait for stragglers.
 ///
@@ -230,7 +232,8 @@ struct Inner {
     failures: Mutex<BTreeMap<Cause, usize>>,
 }
 
-/// A resolver that reqwest can be built with and the survey can warm.
+/// A resolver that reqwest can be built with and both stages — the survey
+/// and the discovery pipeline — warm before their requests.
 ///
 /// Cheap to clone — every clone shares one cache and one backend.
 #[derive(Clone)]
@@ -389,6 +392,15 @@ impl fmt::Display for FailureReport {
 }
 
 impl Inner {
+    /// Resolves `host`, consulting (and filling) the cache.
+    ///
+    /// No single-flight: a check-then-insert cache whose guard is released
+    /// across the lookup cannot collapse two concurrent misses for one
+    /// name, so each would run its own retry ladder. Nothing on a current
+    /// call path lets that happen — both stages warm each name at most once
+    /// (see `mirrors::distinct_by_host`) and finish resolving before any
+    /// request that could re-ask arrives — and that ordering is the
+    /// invariant to preserve if this ever gains concurrent callers.
     async fn addrs_for(&self, host: &str) -> Result<Vec<SocketAddr>, Failure> {
         // Scoped so the guard is never alive across the await below.
         if let Some(hit) = self.cache.lock().expect("Cache mutex poisoned").get(host) {

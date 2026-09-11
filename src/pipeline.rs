@@ -25,8 +25,9 @@ use crate::{
 
 /// How long the latency phase probes mirrors before statistics are computed.
 ///
-/// At one probe a second this yields a cold probe plus a handful of warm
-/// ones per mirror — enough for a stable mean without stalling the run.
+/// At one probe a second this yields a cold probe plus two warm ones per
+/// mirror — three when the jitter draws run low — enough for a stable mean
+/// without stalling the run.
 const LATENCY_PHASE_DURATION: Duration = Duration::from_secs(3);
 
 /// Interval between probes against the same mirror in the latency phase
@@ -335,16 +336,14 @@ pub(crate) fn compute_and_filter_pings(
     mirrors: Vec<MirrorData<PingStatRunning>>,
     ping_k: NonZeroUsize,
 ) -> Result<Vec<MirrorData<PingStatComputed>>, snafu::Whatever> {
-    // A mirror whose only success was the cold probe is dropped outright
-    // rather than judged by its handshake sample. The count below is a
-    // provisional metric watching that policy's cost: if it stays high, the
-    // alternative is to fall back to the setup sample for such mirrors.
+    // The setup-only policy itself is documented at the drop site, inside
+    // the loop; `setup_only` is its provisional cost metric.
     let mut setup_only = 0usize;
     let mut kept = Vec::new();
     for data in mirrors {
         // Diagnosed before `compute_pings`, which consumes `data`: a mirror
         // whose only success was the cold probe is dropped outright rather
-        // than judged by its handshake sample. The count below is a
+        // than judged by its handshake sample. The count above is a
         // provisional metric watching that policy's cost: if it stays high,
         // the alternative is to fall back to the setup sample for such
         // mirrors.
@@ -450,7 +449,7 @@ pub(crate) fn rank_by_throughput(
 pub(crate) fn print_summary(mirrors: &[MirrorData<PingStatComputed, f64>]) {
     for data in mirrors {
         eprintln!(
-            "{}:\n  * DL speed: {}\n  * TTFB: {:.2?}",
+            "{}:\n  * DL speed: {}\n  * Mean latency: {:.2?}",
             data.mirror.url,
             data.dl_speed.human_throughput_bytes(),
             data.ping_stat.mean()
@@ -469,6 +468,13 @@ pub(crate) async fn dl_mirror<T>(
     mirror_data: &MirrorData<T>,
     dl_progress: &ProgressBar,
 ) -> Result<f64, snafu::Whatever> {
+    /// One budget for the whole per-mirror throughput measurement: the
+    /// `core.db` discovery request, the wait for the package's response
+    /// headers, and the body download window each get these 2 seconds.
+    ///
+    /// Long enough for the largest package's bytes to make a 2s sample of
+    /// the link meaningful, short enough that the serial phase across all
+    /// survivors stays bounded no matter how many of them stall.
     const TIME_LIMIT: Duration = Duration::from_secs(2);
 
     let largest_file_url =

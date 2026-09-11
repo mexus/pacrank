@@ -31,11 +31,12 @@ impl PingStatComputed {
     /// Mean of the warm samples — the headline latency figure used for
     /// ranking mirrors.
     ///
-    /// The plain mean, not a median or a trimmed variant: with the two warm
-    /// samples the latency phase collects, every robust variant degenerates
-    /// into picking one of the two probes, while the average at least uses
-    /// both. (This replaced a 10 000-resample bootstrap whose median is the
-    /// sample mean by construction at that sample size.)
+    /// The plain mean, not a median or a trimmed variant: with the two (at
+    /// low jitter draws, three) warm samples the latency phase collects,
+    /// every robust variant degenerates into picking one of the probes,
+    /// while the average at least uses them all. (This replaced a
+    /// 10 000-resample bootstrap whose median is the sample mean by
+    /// construction at that sample size.)
     pub fn mean(&self) -> Duration {
         self.mean
     }
