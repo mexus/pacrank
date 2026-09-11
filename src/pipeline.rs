@@ -165,14 +165,9 @@ pub async fn fetch_and_filter_mirrors(
     client: &reqwest::Client,
     countries: &[CountryCode],
 ) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
-    let Mirrors::V3(mirrors) = client
-        .get("https://archlinux.org/mirrors/status/json/")
-        .send()
+    let Mirrors::V3(mirrors) = crate::mirrors::fetch(client)
         .await
-        .whatever_context("Can't fetch mirrors list")?
-        .json()
-        .await
-        .whatever_context("Can't parse mirrors list")?;
+        .whatever_context("Can't fetch the mirrors list")?;
     tracing::info!("Fetched {} mirrors", mirrors.urls.len());
 
     // 48h is a loose freshness gate: a mirror that's briefly behind during

@@ -151,10 +151,8 @@ pub struct DetectOptions {
 pub enum DetectError {
     /// Building the HTTP client failed.
     BuildClient { source: reqwest::Error },
-    /// Fetching the global mirrors list failed.
+    /// Fetching or parsing the global mirrors list failed.
     FetchMirrors { source: reqwest::Error },
-    /// Parsing the global mirrors list failed.
-    ParseMirrors { source: reqwest::Error },
     /// Constructing a Tokio runtime failed.
     BuildRuntime { source: std::io::Error },
     /// All public-IP endpoints failed AND no usable cache existed to fall
@@ -185,7 +183,6 @@ impl DetectError {
         // inherit either answer.
         match self {
             Self::FetchMirrors { .. }
-            | Self::ParseMirrors { .. }
             // Neither of these can reach the fallback (both are raised before
             // it), but the pipeline reconstructs the same client and runtime,
             // so a cache could not save them either.
@@ -331,14 +328,9 @@ async fn survey(
     client: &reqwest::Client,
     resolver: &SurveyResolver,
 ) -> Result<Vec<Sample>, DetectError> {
-    let Mirrors::V3(mirrors) = client
-        .get("https://archlinux.org/mirrors/status/json/")
-        .send()
+    let Mirrors::V3(mirrors) = crate::mirrors::fetch(client)
         .await
-        .context(FetchMirrorsSnafu)?
-        .json()
-        .await
-        .context(ParseMirrorsSnafu)?;
+        .context(FetchMirrorsSnafu)?;
 
     let max_delay = Duration::from_hours(48);
     let oldest_sync = OffsetDateTime::now_utc() - max_delay;
@@ -770,11 +762,7 @@ mod test {
         let fetch = DetectError::FetchMirrors {
             source: any_reqwest_error().await,
         };
-        let parse = DetectError::ParseMirrors {
-            source: any_reqwest_error().await,
-        };
         assert!(fetch.is_fatal(), "{fetch:?}");
-        assert!(parse.is_fatal(), "{parse:?}");
     }
 
     /// Detection-specific failures say nothing about the download phase, so

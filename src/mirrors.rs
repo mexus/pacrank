@@ -322,6 +322,18 @@ impl Mirror {
     }
 }
 
+/// Endpoint carrying the official mirror status document.
+const STATUS_URL: &str = "https://archlinux.org/mirrors/status/json/";
+
+/// Fetches the current mirror status document.
+///
+/// Both consumers of the list — the country survey and the discovery
+/// pipeline — read this one endpoint; sharing the fetch keeps the URL (and
+/// the lenient parse behavior below it) single-sourced.
+pub async fn fetch(client: &reqwest::Client) -> Result<Mirrors, reqwest::Error> {
+    client.get(STATUS_URL).send().await?.json().await
+}
+
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
