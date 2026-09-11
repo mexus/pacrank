@@ -324,8 +324,8 @@ impl Mirror {
     /// The mirror's `lastsync` URL — cheap to HEAD and present on every
     /// mirror, which makes it the probe target for both the survey and the
     /// latency phase.
-    pub fn lastsync_url(&self) -> Option<url::Url> {
-        self.url.join("lastsync").ok()
+    pub fn lastsync_url(&self) -> Result<url::Url, url::ParseError> {
+        self.url.join("lastsync")
     }
 
     /// Whether this mirror synced within [`FRESHNESS_WINDOW`], reports a
@@ -341,6 +341,28 @@ impl Mirror {
     }
 }
 
+/// The first mirror of each distinct hostname, in input order.
+///
+/// `http://X` and `https://X` are two mirrors but one machine, so any stage
+/// that resolves or probes hosts wants each name once, keeping the first
+/// entry it sees. A mirror without a hostname at all never makes the cut —
+/// neither consumer can do anything with it.
+pub(crate) fn distinct_by_host<'a, I>(mirrors: I) -> Vec<&'a Mirror>
+where
+    I: IntoIterator<Item = &'a Mirror>,
+{
+    let mut seen = HashSet::new();
+    mirrors
+        .into_iter()
+        .filter(|mirror| {
+            mirror
+                .url
+                .host_str()
+                .is_some_and(|host| seen.insert(host.to_owned()))
+        })
+        .collect()
+}
+
 /// How recent a mirror's last sync must be for either stage to consider it.
 ///
 /// 48 h is a loose freshness gate: a mirror briefly behind during its own
@@ -351,13 +373,28 @@ pub const FRESHNESS_WINDOW: Duration = Duration::from_hours(48);
 /// Endpoint carrying the official mirror status document.
 const STATUS_URL: &str = "https://archlinux.org/mirrors/status/json/";
 
+/// How long fetching the mirror status document may take in total.
+///
+/// The document is a few MB of JSON, so the bound has to be generous
+/// enough for a slow uplink to land it — but it must exist: this is the
+/// first network action of both the survey and the pipeline, and without
+/// it a stalled archlinux.org response (the shared client sets only a
+/// connect timeout) would hang the run before anything else happens.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Fetches the current mirror status document.
 ///
 /// Both consumers of the list — the country survey and the discovery
 /// pipeline — read this one endpoint; sharing the fetch keeps the URL (and
 /// the lenient parse behavior below it) single-sourced.
 pub async fn fetch(client: &reqwest::Client) -> Result<Mirrors, reqwest::Error> {
-    client.get(STATUS_URL).send().await?.json().await
+    client
+        .get(STATUS_URL)
+        .timeout(FETCH_TIMEOUT)
+        .send()
+        .await?
+        .json()
+        .await
 }
 
 #[cfg(test)]

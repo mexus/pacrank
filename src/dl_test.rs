@@ -55,10 +55,9 @@ where
     U: IntoUrl,
     F: FnMut(u64, Option<u64>),
 {
-    let mut response = tokio::time::timeout(
-        time_limit,
-        async { client.get(url).send().await?.error_for_status() },
-    )
+    let mut response = tokio::time::timeout(time_limit, async {
+        client.get(url).send().await?.error_for_status()
+    })
     .await
     .map_err(|elapsed| DlError::TimedOut { source: elapsed })?
     .map_err(|source| DlError::Http { source })?;

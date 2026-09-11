@@ -15,7 +15,7 @@ use display_error_chain::DisplayErrorChain;
 use futures_util::StreamExt;
 use human_repr::HumanThroughput;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use snafu::{OptionExt, ResultExt};
+use snafu::ResultExt;
 use url::Url;
 
 use crate::{
@@ -207,27 +207,27 @@ pub async fn fetch_and_filter_mirrors(
 /// straight from the cache — and a dead name costs one lookup here instead of
 /// occupying a whole ping stream for the phase.
 ///
-/// Hostnames are deduplicated before warming, exactly like the survey's
-/// candidate list: the mirror list carries `http://X` and `https://X` as two
-/// mirrors sharing one name, and the cache cannot collapse two lookups that
-/// race — warmed concurrently, each twin would burn its own lookup and, when
-/// the resolver is already struggling, its own retry ladder. One lookup per
-/// name is also one verdict per name: twins can no longer diverge over
-/// whether their host resolves.
+/// Hostnames are deduplicated before warming (see
+/// [`mirrors::distinct_by_host`]): the mirror list carries `http://X` and
+/// `https://X` as two mirrors sharing one name, and the cache cannot
+/// collapse two lookups that race — warmed concurrently, each twin would
+/// burn its own lookup and, when the resolver is already struggling, its
+/// own retry ladder. One lookup per name is also one verdict per name:
+/// twins can no longer diverge over whether their host resolves.
 pub async fn resolve_phase(
     resolver: &crate::dns::SurveyResolver,
     mirrors: Vec<MirrorData<PingStatRunning>>,
 ) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
     let total = mirrors.len();
-    // One warm per distinct hostname, in first-seen order — the same
-    // `seen_hosts` idiom the survey's candidate list uses. A mirror with no
-    // hostname at all never makes the cut either.
-    let mut seen_hosts = HashSet::new();
-    let hosts: Vec<String> = mirrors
-        .iter()
-        .filter_map(|data| data.mirror.url.host_str().map(str::to_owned))
-        .filter(|host| seen_hosts.insert(host.clone()))
-        .collect();
+    // One warm per distinct hostname, in first-seen order — see
+    // `mirrors::distinct_by_host`.
+    let hosts: Vec<String> =
+        crate::mirrors::distinct_by_host(mirrors.iter().map(|data| &data.mirror))
+            .into_iter()
+            // Guaranteed present by `distinct_by_host`; the `filter_map` only
+            // satisfies the type of `host_str`.
+            .filter_map(|mirror| mirror.url.host_str().map(str::to_owned))
+            .collect();
     let lookups = hosts.len();
     let resolved: HashSet<_> = futures_util::stream::iter(hosts)
         .map(|host| async move { resolver.warm(&host).await.then_some(host) })

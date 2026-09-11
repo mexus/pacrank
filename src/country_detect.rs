@@ -7,7 +7,6 @@
 //! discovery pipeline filters by.
 
 use std::{
-    collections::HashSet,
     fs,
     net::IpAddr,
     num::NonZeroUsize,
@@ -333,21 +332,26 @@ async fn survey(
         .await
         .context(FetchMirrorsSnafu)?;
 
-    // One entry per host. `http://X` and `https://X` are two mirrors but one
-    // machine in one country, so probing both answers the same question twice;
-    // dropping the duplicates takes ~805 entries down to ~487 for free.
-    let mut seen_hosts = HashSet::new();
-    let candidates: Vec<_> = mirrors
-        .urls
-        .into_iter()
-        .filter(|m| m.is_fresh() && m.country_code != CountryCode::Unknown)
-        .filter_map(|m| {
-            let host = m.url.host_str()?.to_owned();
-            let url = m.lastsync_url()?;
-            Some((m.country_code, url, host))
-        })
-        .filter(|(_, _, host)| seen_hosts.insert(host.clone()))
-        .collect();
+    // One entry per host — `distinct_by_host` keeps the first mirror of
+    // each name, taking ~805 entries down to ~487 for free.
+    let candidates: Vec<_> = crate::mirrors::distinct_by_host(
+        mirrors
+            .urls
+            .iter()
+            .filter(|m| m.is_fresh() && m.country_code != CountryCode::Unknown),
+    )
+    .into_iter()
+    .filter_map(|m| {
+        // The host is guaranteed by `distinct_by_host`; the lastsync join
+        // can still fail on a pathological base URL, and such a mirror is
+        // simply not a candidate.
+        Some((
+            m.country_code,
+            m.lastsync_url().ok()?,
+            m.url.host_str()?.to_owned(),
+        ))
+    })
+    .collect();
 
     let candidate_count = candidates.len();
     tracing::info!(
