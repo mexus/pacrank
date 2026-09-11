@@ -300,11 +300,20 @@ fn spawn_worker_and_read_mirrors(child_args: &[String]) -> Result<Vec<Url>, snaf
         .whatever_context("Discovering the best mirrors has failed")
 }
 
+// `concat!` only accepts literals, so both consts below build from this
+// macro instead — one spelling of the directory rather than two that
+// could drift apart.
+macro_rules! pacman_d {
+    () => {
+        "/etc/pacman.d/"
+    };
+}
+
 /// The pacman configuration directory the mirrorlist lives in.
-const PACMAN_D_DIR: &str = "/etc/pacman.d/";
+const PACMAN_D_DIR: &str = pacman_d!();
 
 /// The mirrorlist file this tool atomically replaces.
-const MIRRORLIST_PATH: &str = "/etc/pacman.d/mirrorlist";
+const MIRRORLIST_PATH: &str = concat!(pacman_d!(), "mirrorlist");
 
 /// Atomically replaces `/etc/pacman.d/mirrorlist` with pacman-compatible
 /// `Server = ...` lines derived from the given URLs.
