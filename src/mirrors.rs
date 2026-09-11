@@ -608,4 +608,114 @@ pub(crate) mod test {
         CountryCode::dedup(&mut countries);
         assert_eq!(countries, expected);
     }
+
+    /// A fresh mirror fixture; every field is overridable through the
+    /// arguments so each predicate case reads as its one difference from
+    /// the defaults.
+    fn fresh_mirror(
+        protocol: Protocol,
+        last_sync: Option<time::OffsetDateTime>,
+        delay: Option<i64>,
+    ) -> Mirror {
+        Mirror {
+            url: "https://mirror.example.com/archlinux/".parse().unwrap(),
+            protocol,
+            country_code: CountryCode::DE,
+            delay,
+            last_sync,
+        }
+    }
+
+    fn hours_ago(n: i64) -> time::OffsetDateTime {
+        time::OffsetDateTime::now_utc() - time::Duration::hours(n)
+    }
+
+    /// The shared gate both stages filter by — cheap to pin exhaustively,
+    /// load-bearing to get right: it decides what the whole tool is allowed
+    /// to rank.
+    #[test]
+    fn is_fresh_gate() {
+        let http = fresh_mirror(Protocol::Http, Some(hours_ago(1)), Some(60));
+        assert!(http.is_fresh(), "a plain healthy HTTP mirror passes");
+
+        // Missing either timestamp or delay: not decidable, dropped.
+        assert!(!fresh_mirror(Protocol::Https, None, Some(60)).is_fresh());
+        assert!(!fresh_mirror(Protocol::Https, Some(hours_ago(1)), None).is_fresh());
+
+        // Non-HTTP protocols never reach the mirrorlist. Ftp only ever
+        // arrives as `Protocol::Unknown` after deserialization, but the
+        // predicate's answer is the same for any non-HTTP variant.
+        assert!(!fresh_mirror(Protocol::Rsync, Some(hours_ago(1)), Some(60)).is_fresh());
+        assert!(!fresh_mirror(Protocol::Unknown, Some(hours_ago(1)), Some(60)).is_fresh());
+
+        // Stale syncs and long delays are the two halves of the 48h window.
+        assert!(fresh_mirror(Protocol::Https, Some(hours_ago(47)), Some(60)).is_fresh());
+        assert!(!fresh_mirror(Protocol::Https, Some(hours_ago(49)), Some(60)).is_fresh());
+        assert!(!fresh_mirror(Protocol::Https, Some(hours_ago(1)), Some(172_801)).is_fresh());
+
+        // The boundaries are inclusive by design (`>=`/`<=`): a mirror
+        // exactly on the line is kept. Delay is checked against a constant,
+        // so the boundary is exact; a timestamp on the line would race
+        // `now_utc()` between fixture and call, hence 47h/49h above.
+        assert!(fresh_mirror(Protocol::Https, Some(hours_ago(1)), Some(172_800)).is_fresh());
+
+        // Negative delays are real (clock-skewed mirrors) and pass the `<=`
+        // comparison, like the live `repository.su` entry.
+        assert!(fresh_mirror(Protocol::Https, Some(hours_ago(1)), Some(-33)).is_fresh());
+
+        // A future timestamp (skew in the other direction) is not stale.
+        assert!(fresh_mirror(Protocol::Https, Some(hours_ago(-1)), Some(60)).is_fresh());
+    }
+
+    /// First mirror per hostname, in input order — the collapse both stages
+    /// apply before resolving or probing.
+    #[test]
+    fn distinct_by_host_keeps_first_seen_order() {
+        let twins = |scheme: &str| {
+            format!("{scheme}://mirror.example.com/archlinux/")
+                .parse()
+                .unwrap()
+        };
+        let mut http_twin = fresh_mirror(Protocol::Http, Some(hours_ago(1)), Some(60));
+        http_twin.url = twins("http");
+        let mut https_twin = fresh_mirror(Protocol::Https, Some(hours_ago(1)), Some(60));
+        https_twin.url = twins("https");
+        let mut other = fresh_mirror(Protocol::Https, Some(hours_ago(1)), Some(60));
+        other.url = "https://other.example.org/archlinux/".parse().unwrap();
+        let mut hostless = fresh_mirror(Protocol::Https, Some(hours_ago(1)), Some(60));
+        hostless.url = "data:mirror/example".parse().unwrap();
+
+        let kept = distinct_by_host([&http_twin, &https_twin, &other, &hostless]);
+        assert_eq!(
+            kept.iter().map(|m| m.url.as_str()).collect::<Vec<_>>(),
+            [
+                "http://mirror.example.com/archlinux/",
+                "https://other.example.org/archlinux/"
+            ],
+            "one entry per host, the first one seen; a hostless mirror never makes the cut"
+        );
+    }
+
+    /// The version dispatch behind `Mirrors`' custom Deserialize: only v3
+    /// parses, and both an unknown version and a missing one say so.
+    #[test]
+    fn version_dispatch() {
+        let Mirrors::V3(mirrors) =
+            serde_json::from_str(MIRRORS_EXCERPT).expect("version 3 must parse");
+        assert_eq!(mirrors.urls.len(), 4);
+
+        let v4 = MIRRORS_EXCERPT.replace("\"version\": 3", "\"version\": 4");
+        let err =
+            serde_json::from_str::<Mirrors>(&v4).expect_err("an unknown version must be rejected");
+        assert!(
+            err.to_string().contains("version 4"),
+            "the error should name the version: {err}"
+        );
+
+        let versionless = MIRRORS_EXCERPT.replace(",\n        \"version\": 3", "");
+        assert!(
+            serde_json::from_str::<Mirrors>(&versionless).is_err(),
+            "a missing version must be rejected"
+        );
+    }
 }
