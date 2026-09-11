@@ -113,12 +113,8 @@ pub async fn discover(
                 .context(ReadEntrySnafu { path: &path })?;
             match crate::arch_desc::extract_data(&buf) {
                 Ok(entry) => {
-                    if let Some(largest_entry) = &mut largest_entry {
-                        if entry.size > largest_entry.size {
-                            *largest_entry = entry;
-                        }
-                    } else {
-                        largest_entry = Some(entry)
+                    if largest_entry.as_ref().is_none_or(|l| entry.size > l.size) {
+                        largest_entry = Some(entry);
                     }
                 }
                 // A single malformed `desc` shouldn't abort discovery — log

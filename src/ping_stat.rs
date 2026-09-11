@@ -138,9 +138,9 @@ impl PingStatRunning {
 
         let mut means = Vec::with_capacity(REPEATS);
         for _ in 0..REPEATS {
-            resampled
-                .iter_mut()
-                .for_each(|sample| *sample = self.warm[rng.sample(distr)]);
+            for sample in &mut resampled {
+                *sample = self.warm[rng.sample(distr)];
+            }
             let mean = resampled.iter().map(|d| d.as_secs_f64()).sum::<f64>() / warm_count as f64;
             means.push(mean);
         }

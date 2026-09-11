@@ -61,24 +61,29 @@ pub fn extract_data(contents: &[u8]) -> Result<EntryDescription, ExtractionError
         .split(|byte| *byte == b'\n')
         .map(|line| line.trim_ascii());
     while let Some(current) = lines.next() {
-        if current == b"%FILENAME%" {
-            let next = lines.next().context(UnexpectedEofSnafu)?;
-            let string_value = std::str::from_utf8(next).context(NonUtf8Snafu {
-                name: "FILENAME",
-                line: next,
-            })?;
-            file_name = Some(string_value.to_owned());
-        } else if current == b"%CSIZE%" {
-            let next = lines.next().context(UnexpectedEofSnafu)?;
-            let string_value = std::str::from_utf8(next).context(NonUtf8Snafu {
-                name: "CSIZE",
-                line: next,
-            })?;
-            let size: u64 = string_value.parse().context(InvalidSizeSnafu {
-                value: string_value,
-                name: "CSIZE",
-            })?;
-            compressed_size = Some(size);
+        match current {
+            b"%FILENAME%" => {
+                let next = lines.next().context(UnexpectedEofSnafu)?;
+                let string_value = std::str::from_utf8(next).context(NonUtf8Snafu {
+                    name: "FILENAME",
+                    line: next,
+                })?;
+                file_name = Some(string_value.to_owned());
+            }
+            b"%CSIZE%" => {
+                let next = lines.next().context(UnexpectedEofSnafu)?;
+                let string_value = std::str::from_utf8(next).context(NonUtf8Snafu {
+                    name: "CSIZE",
+                    line: next,
+                })?;
+                let size: u64 = string_value.parse().context(InvalidSizeSnafu {
+                    value: string_value,
+                    name: "CSIZE",
+                })?;
+                compressed_size = Some(size);
+            }
+            // Any other block — %NAME%, %DESC%, %PGPSIG%, … — is skipped.
+            _ => {}
         }
     }
 
