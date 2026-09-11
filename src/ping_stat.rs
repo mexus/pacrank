@@ -108,17 +108,19 @@ impl PingStatRunning {
 }
 
 #[cfg(test)]
-mod test {
+pub(crate) mod test {
     use super::*;
 
-    fn warm(ms: u64) -> Probe {
+    /// A warm-probe fixture — shared with the pipeline tests, which build
+    /// the same accumulators latency_phase would have left behind.
+    pub(crate) fn warm(ms: u64) -> Probe {
         Probe {
             latency: Duration::from_millis(ms),
             cold: false,
         }
     }
 
-    fn cold(ms: u64) -> Probe {
+    pub(crate) fn cold(ms: u64) -> Probe {
         Probe {
             latency: Duration::from_millis(ms),
             cold: true,

@@ -512,7 +512,7 @@ pub(crate) async fn dl_mirror<T>(
 mod test {
     use super::*;
     use crate::mirrors::Protocol;
-    use crate::ping_test::Probe;
+    use crate::ping_stat::test::{cold, warm};
 
     /// A well-formed HTTPS mirror with a distinct, sortable host name.
     fn mirror(n: usize) -> Mirror {
@@ -532,16 +532,10 @@ mod test {
     fn running(n: usize, warm_ms: &[u64], setup_ms: Option<u64>) -> MirrorData<PingStatRunning> {
         let mut data = MirrorData::try_new(mirror(n)).expect("lastsync join must succeed");
         if let Some(setup) = setup_ms {
-            data.ping_stat.record_ping(Probe {
-                latency: Duration::from_millis(setup),
-                cold: true,
-            });
+            data.ping_stat.record_ping(cold(setup));
         }
         for ms in warm_ms {
-            data.ping_stat.record_ping(Probe {
-                latency: Duration::from_millis(*ms),
-                cold: false,
-            });
+            data.ping_stat.record_ping(warm(*ms));
         }
         data
     }
