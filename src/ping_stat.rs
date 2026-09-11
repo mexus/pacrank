@@ -192,4 +192,31 @@ mod test {
         let computed = stat.compute().unwrap();
         assert_eq!(computed.setup(), Some(Duration::from_millis(300)));
     }
+
+    /// The survey's ranking statistic: the upper median — an even count
+    /// takes the slower of the two middle samples (`len/2`), which biases
+    /// toward caution when picking nearby countries.
+    #[test]
+    fn warm_median_is_the_upper_median() {
+        let mut stat = PingStatRunning::default();
+        assert_eq!(stat.warm_median(), None, "no samples, no median");
+
+        stat.record_ping(warm(42));
+        assert_eq!(stat.warm_median(), Some(Duration::from_millis(42)));
+
+        stat.record_ping(warm(10));
+        assert_eq!(
+            stat.warm_median(),
+            Some(Duration::from_millis(42)),
+            "even count: the slower middle sample wins"
+        );
+
+        // Arrival order must not matter — the median is of the sorted
+        // samples, not of the arrival sequence.
+        let mut shuffled = PingStatRunning::default();
+        for ms in [30, 10, 50, 20, 40] {
+            shuffled.record_ping(warm(ms));
+        }
+        assert_eq!(shuffled.warm_median(), Some(Duration::from_millis(30)));
+    }
 }

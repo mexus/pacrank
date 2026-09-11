@@ -1016,4 +1016,23 @@ mod test {
         fs::write(&path, b"this is not json").unwrap();
         assert!(load_cache(&path).is_none());
     }
+
+    /// Cache freshness, including the clock-skew branch: a cache stamped in
+    /// the future (negative age) is fresh rather than triggering a
+    /// re-detect.
+    #[test]
+    fn cache_freshness() {
+        let entry = |detected_at| CacheEntry {
+            ip_prefix: "203.0.0.0/16".to_string(),
+            detected_at,
+            countries: vec![CountryCode::DE],
+        };
+        // The constant matters here (TTL is a month), so one hour either
+        // way cannot race the clock.
+        let now = OffsetDateTime::now_utc();
+        assert!(fresh_enough(&entry(now - time::Duration::hours(1))));
+        assert!(!fresh_enough(&entry(now - time::Duration::hours(24 * 31))));
+        // Negative age: Duration::try_from fails on the negative span.
+        assert!(fresh_enough(&entry(now + time::Duration::hours(1))));
+    }
 }
