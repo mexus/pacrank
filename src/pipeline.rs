@@ -488,3 +488,175 @@ pub async fn dl_mirror<T>(
     );
     Ok(speed)
 }
+
+#[cfg(test)]
+mod test {
+    use rand::rngs::StdRng;
+
+    use super::*;
+    use crate::mirrors::Protocol;
+    use crate::ping_test::Probe;
+
+    /// A well-formed HTTPS mirror with a distinct, sortable host name.
+    fn mirror(n: usize) -> Mirror {
+        Mirror {
+            url: format!("https://mirror-{n}.example.com/archlinux/")
+                .parse()
+                .expect("test mirror URL must parse"),
+            protocol: Protocol::Https,
+            country_code: CountryCode::DE,
+            delay: Some(60),
+            last_sync: Some(OffsetDateTime::now_utc()),
+        }
+    }
+
+    /// A pipeline entry with `setup_ms` cold and `warm_ms` warm samples
+    /// recorded, exactly as `latency_phase` would have left it.
+    fn running(n: usize, warm_ms: &[u64], setup_ms: Option<u64>) -> MirrorData<PingStatRunning> {
+        let mut data = MirrorData::try_new(mirror(n)).expect("lastsync join must succeed");
+        if let Some(setup) = setup_ms {
+            data.ping_stat.record_ping(Probe {
+                latency: Duration::from_millis(setup),
+                cold: true,
+            });
+        }
+        for ms in warm_ms {
+            data.ping_stat.record_ping(Probe {
+                latency: Duration::from_millis(*ms),
+                cold: false,
+            });
+        }
+        data
+    }
+
+    /// The same entry after `compute_pings` — with uniform warm samples the
+    /// bootstrap median collapses onto the sample value, so callers can
+    /// assert exact latencies.
+    fn computed(n: usize, warm_ms: &[u64]) -> MirrorData<PingStatComputed> {
+        let mut rng = StdRng::seed_from_u64(1337);
+        running(n, warm_ms, Some(50))
+            .compute_pings(&mut rng)
+            .expect("warm samples must compute")
+    }
+
+    fn ping_k(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("nonzero")
+    }
+
+    /// A mirror whose only success was the cold probe is dropped outright,
+    /// not judged by its handshake sample.
+    #[test]
+    fn setup_only_mirrors_are_dropped() {
+        let mirrors = vec![
+            running(0, &[100, 110, 120], Some(900)),
+            running(1, &[], Some(400)),
+        ];
+        let kept = compute_and_filter_pings(mirrors, ping_k(10)).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].mirror.url.as_str(),
+            "https://mirror-0.example.com/archlinux/"
+        );
+        // The surviving one is the warm one, despite the slower setup.
+        assert_eq!(kept[0].ping_stat.median(), Duration::from_millis(110));
+    }
+
+    /// A bootstrap median above `MAX_ACCEPTABLE_MEDIAN` disqualifies the
+    /// mirror from the throughput phase.
+    #[test]
+    fn slow_medians_are_dropped() {
+        let mirrors = vec![running(0, &[1500, 1500], Some(400))];
+        assert!(compute_and_filter_pings(mirrors, ping_k(10)).is_err());
+    }
+
+    /// `ping_k` keeps the fastest survivors, sorted by median ascending.
+    #[test]
+    fn ping_k_truncates_to_the_fastest_in_median_order() {
+        let mirrors = vec![
+            running(0, &[300, 300], Some(400)),
+            running(1, &[100, 100], Some(400)),
+            running(2, &[200, 200], Some(400)),
+        ];
+        let kept = compute_and_filter_pings(mirrors, ping_k(2)).unwrap();
+        let medians: Vec<Duration> = kept.iter().map(|m| m.ping_stat.median()).collect();
+        assert_eq!(
+            medians,
+            [Duration::from_millis(100), Duration::from_millis(200)]
+        );
+    }
+
+    /// No warm samples anywhere means nothing to continue with.
+    #[test]
+    fn all_setup_only_is_an_error() {
+        let mirrors = vec![running(0, &[], Some(400)), running(1, &[], None)];
+        assert!(compute_and_filter_pings(mirrors, ping_k(10)).is_err());
+    }
+
+    /// Mirrors that failed the download measurement are filtered, not
+    /// ranked.
+    #[test]
+    fn unmeasured_mirrors_are_dropped() {
+        let mut fast = computed(0, &[100, 100]);
+        fast.dl_speed = Some(50.0);
+        let mut failed = computed(1, &[200, 200]);
+        failed.dl_speed = None;
+        let ranked = rank_by_throughput(vec![failed, fast], ping_k(10)).unwrap();
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].dl_speed, 50.0);
+    }
+
+    /// Ranking is descending, and equal speeds keep their input order
+    /// (stable sort under `total_cmp`).
+    #[test]
+    fn ranking_is_descending_and_stable() {
+        let mut a = computed(0, &[100, 100]);
+        a.dl_speed = Some(30.0);
+        let mut b = computed(1, &[200, 200]);
+        b.dl_speed = Some(50.0);
+        let mut c = computed(2, &[300, 300]);
+        c.dl_speed = Some(30.0);
+        let mut d = computed(3, &[400, 400]);
+        d.dl_speed = Some(10.0);
+        let ranked = rank_by_throughput(vec![a, b, c, d], ping_k(10)).unwrap();
+        let order: Vec<&str> = ranked
+            .iter()
+            .map(|m| m.mirror.url.host_str().expect("host"))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "mirror-1.example.com",
+                "mirror-0.example.com",
+                "mirror-2.example.com",
+                "mirror-3.example.com",
+            ]
+        );
+    }
+
+    /// `dl_k` truncates the ranked list from the top.
+    #[test]
+    fn dl_k_truncates() {
+        let mut a = computed(0, &[100, 100]);
+        a.dl_speed = Some(10.0);
+        let mut b = computed(1, &[200, 200]);
+        b.dl_speed = Some(50.0);
+        let mut c = computed(2, &[300, 300]);
+        c.dl_speed = Some(30.0);
+        let ranked = rank_by_throughput(vec![a, b, c], ping_k(2)).unwrap();
+        assert_eq!(
+            ranked.iter().map(|m| m.dl_speed as i64).collect::<Vec<_>>(),
+            [50, 30]
+        );
+    }
+
+    /// Every download having failed means nothing to write to the
+    /// mirrorlist.
+    #[test]
+    fn all_unmeasured_is_an_error() {
+        let mut a = computed(0, &[100, 100]);
+        a.dl_speed = None;
+        let mut b = computed(1, &[200, 200]);
+        b.dl_speed = None;
+        assert!(rank_by_throughput(vec![a, b], ping_k(10)).is_err());
+    }
+}
