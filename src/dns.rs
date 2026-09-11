@@ -2,13 +2,13 @@
 //!
 //! Three concerns live here that the rest of the crate gets to treat as one:
 //!
-//! * a [`Backend`] choice — an async resolver where the platform lets us have
+//! * a `Backend` choice — an async resolver where the platform lets us have
 //!   one, the system resolver where it does not;
 //! * a cache that doubles as the hand-off between the survey's resolve stage
 //!   and its ping stage. Warming a name and resolving it on reqwest's behalf
 //!   are the same operation, so the survey never threads addresses through its
 //!   pipeline: it warms a name, and the ping that follows hits the cache.
-//! * a reading of what a *failed* lookup meant — see [`Cause`]. A name the
+//! * a reading of what a *failed* lookup meant — see `Cause`. A name the
 //!   resolver answered about negatively is dropped; a resolver that declined
 //!   to answer is simply asked again.
 //!

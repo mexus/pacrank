@@ -169,7 +169,7 @@ impl Default for DetectOptions {
 ///
 /// Cache misses and partial network failures are handled internally and do
 /// not surface as errors — they fall back to either re-detection or a stale
-/// cache as appropriate, unless [`DetectError::is_fatal`] says otherwise.
+/// cache as appropriate, unless `DetectError::is_fatal` says otherwise.
 #[derive(Debug, Snafu)]
 pub enum DetectError {
     /// Building the HTTP client failed.

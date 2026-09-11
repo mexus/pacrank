@@ -68,7 +68,7 @@ impl serde::Serialize for Mirrors {
 pub struct MirrorsV3 {
     /// The actual list of mirrors.
     ///
-    /// Deserialized leniently: see [`lenient_mirrors`].
+    /// Deserialized leniently: see `lenient_mirrors`.
     #[serde(deserialize_with = "lenient_mirrors")]
     pub urls: Vec<Mirror>,
 
