@@ -88,6 +88,15 @@ fn main() -> Result<(), snafu::Whatever> {
         return Ok(());
     }
 
+    // A non-positive threshold is a degenerate one: every latency exceeds
+    // `0 × baseline`, so auto-detection would drop every mirror and fail
+    // with a much less actionable error than this one. (`NaN` fails the
+    // same comparison and is rejected here too.)
+    snafu::ensure_whatever!(
+        detect_threshold > 0.0,
+        "--detect-threshold must be positive, got {detect_threshold}"
+    );
+
     init_tracing();
 
     // Country auto-detection runs in the user-context parent only — never
