@@ -164,3 +164,56 @@ fn open<'a>(bytes: &'a [u8]) -> Result<Box<dyn Read + 'a>, DiscoveryError> {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::io::Write as _;
+
+    use super::*;
+
+    /// The sniffing is exercised on real archives, not hand-placed magic
+    /// bytes, so a decoder mismatch cannot hide behind a correct prefix.
+    #[test]
+    fn open_sniffs_gzip_magic() {
+        let raw = b"not really a tar, but the decoder does not care";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(raw).unwrap();
+        let gz = encoder.finish().unwrap();
+
+        let mut decoded = String::new();
+        open(&gz)
+            .expect("gzip magic must be recognized")
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded.as_bytes(), raw);
+    }
+
+    #[test]
+    fn open_sniffs_zstd_magic() {
+        let raw = b"same deal, zstd flavour";
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 0).unwrap();
+        encoder.write_all(raw).unwrap();
+        let zst = encoder.finish().unwrap();
+
+        let mut decoded = String::new();
+        open(&zst)
+            .expect("zstd magic must be recognized")
+            .read_to_string(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded.as_bytes(), raw);
+    }
+
+    #[test]
+    fn open_rejects_unknown_magic_with_the_leading_bytes() {
+        let bogus = [0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
+        match open(&bogus) {
+            Err(DiscoveryError::UnknownArchive { first_bytes }) => {
+                assert_eq!(first_bytes, vec![0x00, 0x01, 0x02, 0x03, 0x04]);
+            }
+            Err(other) => panic!("unknown magic must be UnknownArchive, got {other:?}"),
+            // The Ok arm holds a `dyn Read`, which has no Debug — say so
+            // without formatting it.
+            Ok(_) => panic!("unknown magic must be UnknownArchive, got Ok"),
+        }
+    }
+}

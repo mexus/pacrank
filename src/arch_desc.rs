@@ -170,4 +170,37 @@ python-virtualenv
         assert_eq!(file_name, "automake-1.18.1-1-any.pkg.tar.zst");
         assert_eq!(size, 649_767);
     }
+
+    /// Every malformed shape reports its own variant — discovery skips bad
+    /// entries based on exactly these, so a wrong variant would mislabel
+    /// the skip in the log and, worse, invite handling that assumes a
+    /// different failure.
+    #[test]
+    fn malformed_descs_report_their_variants() {
+        // No %FILENAME% block at all.
+        assert!(matches!(
+            extract_data(b"%CSIZE%\n100\n"),
+            Err(ExtractionError::NoFilename)
+        ));
+        // No %CSIZE% block at all.
+        assert!(matches!(
+            extract_data(b"%FILENAME%\npkg.tar.zst\n"),
+            Err(ExtractionError::NoCompressedSize)
+        ));
+        // A %KEY% header as the last line has no value to read.
+        assert!(matches!(
+            extract_data(b"%FILENAME%\npkg.tar.zst\n\n%CSIZE%"),
+            Err(ExtractionError::UnexpectedEof)
+        ));
+        // A size line that is not a number.
+        assert!(matches!(
+            extract_data(b"%FILENAME%\npkg.tar.zst\n\n%CSIZE%\nnot-a-number\n"),
+            Err(ExtractionError::InvalidSize { .. })
+        ));
+        // A value line that is not valid UTF-8.
+        assert!(matches!(
+            extract_data(b"%FILENAME%\n\xff\xfe\n"),
+            Err(ExtractionError::NonUtf8 { .. })
+        ));
+    }
 }
