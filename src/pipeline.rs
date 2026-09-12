@@ -276,6 +276,18 @@ pub(crate) async fn latency_phase(
     client: &reqwest::Client,
     mut mirrors: Vec<MirrorData<PingStatRunning>>,
 ) -> Vec<MirrorData<PingStatRunning>> {
+    // The phase is otherwise silent at info level — per-probe outcomes are
+    // debug noise at a hundred mirrors — and a few dead seconds read as a
+    // hang. A number-less spinner says the run is alive without claiming
+    // progress: mirror counts would race the resolve filter's own report
+    // from a moment ago, and probe counts mean nothing to a user.
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("  {spinner:.cyan} Measuring mirror latency")
+            .expect("Template must be OK"),
+    );
+    spinner.enable_steady_tick(Duration::from_millis(120));
+
     // Deadline shared by every ping stream and by each individual request
     // (see `ping_url` for the per-request timeout).
     //
@@ -327,6 +339,7 @@ pub(crate) async fn latency_phase(
             }
         }
     }
+    spinner.finish_and_clear();
     mirrors
 }
 
