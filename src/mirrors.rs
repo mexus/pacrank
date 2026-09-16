@@ -1,6 +1,11 @@
 //! Mirror-related utilities.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
+
+use display_error_chain::DisplayErrorChain;
 
 /// Version-aware mirrors list.
 #[derive(Debug, Clone)]
@@ -373,32 +378,168 @@ pub const FRESHNESS_WINDOW: Duration = Duration::from_hours(48);
 /// Endpoint carrying the official mirror status document.
 const STATUS_URL: &str = "https://archlinux.org/mirrors/status/json/";
 
-/// How long fetching the mirror status document may take in total.
+/// How long one attempt at fetching the mirror status document may take in
+/// total.
 ///
 /// The document is a few MB of JSON, so the bound has to be generous
 /// enough for a slow uplink to land it — but it must exist: this is the
 /// first network action of both the survey and the pipeline, and without
 /// it a stalled archlinux.org response (the shared client sets only a
 /// connect timeout) would hang the run before anything else happens.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// Generous is the operative word, because this endpoint is a single point
+/// of failure: nothing downstream can run without it, so the cost of
+/// waiting is a slow run while the cost of giving up early is no run at
+/// all. With [`FETCH_ATTEMPTS`] and [`RETRY_BACKOFF`] the whole ladder is
+/// bounded at roughly a minute and a half before the run is declared dead.
+///
+/// Note what this bound does *not* cover: establishing the connection is
+/// capped separately, and a total timeout can only ever be the outer of the
+/// two — see [`STATUS_CONNECT_TIMEOUT`].
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Fetches the current mirror status document.
+/// How long the mirror-list client waits for its TCP (+ TLS) connection.
+///
+/// A connect timeout is a client-wide setting in reqwest — `RequestBuilder`
+/// offers only the total [`FETCH_TIMEOUT`] — so raising the total alone
+/// leaves the handshake pinned to whatever the client was built with, and
+/// the shared client is built for *measuring mirrors*
+/// (`crate::CONNECT_TIMEOUT`, 2s). That is why [`fetch`] builds its own
+/// client: this request is the run's prerequisite, and an archlinux.org
+/// handshake that takes four seconds on a congested uplink is a slow run,
+/// not a failed one.
+///
+/// 10s sits an order of magnitude above the normal handshake (~300ms to the
+/// CDN) and still an order below [`FETCH_TIMEOUT`], so a connect that is
+/// merely slow is absorbed while one that is truly hung still leaves the
+/// attempt room to be retried.
+const STATUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many times the mirror status document may be requested before the
+/// run gives up on it.
+///
+/// Only failures that [`is_retryable`] accepts consume an attempt beyond the
+/// first, so a permanently broken answer still costs exactly one request.
+///
+/// More than one attempt is not paranoia. A run on 2026-09-16, back when
+/// this fetch still borrowed the measurement client's 2s connect cap, lost
+/// two attempts in a row to that timeout and landed the document on the
+/// third — a run that, with a single attempt, dies before it starts.
+/// [`STATUS_CONNECT_TIMEOUT`] is the answer to that particular failure;
+/// the attempts are the answer to the general one, since a lost packet or a
+/// front end mid-restart does not care how patient a single attempt is.
+const FETCH_ATTEMPTS: u32 = 3;
+
+/// Base delay before a retry; doubled per attempt.
+///
+/// Unjittered, unlike [`crate::dns`]'s ladder: that one spreads a burst of
+/// concurrent lookups off each other, whereas this is one request to one
+/// host, with nothing to collide with.
+const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Fetches the current mirror status document, retrying a transient
+/// failure up to [`FETCH_ATTEMPTS`] times.
 ///
 /// Both consumers of the list — the country survey and the discovery
 /// pipeline — read this one endpoint; sharing the fetch keeps the URL (and
 /// the lenient parse behavior below it) single-sourced.
-pub async fn fetch(client: &reqwest::Client) -> Result<Mirrors, reqwest::Error> {
+///
+/// Takes the resolver rather than a ready client because the connect budget
+/// is part of what this operation is (see [`STATUS_CONNECT_TIMEOUT`]) and
+/// reqwest can only express it at client level. The resolver is still the
+/// caller's own, so the name is looked up once for the whole run; only the
+/// connection pool is private to this request.
+pub async fn fetch(resolver: &crate::dns::SurveyResolver) -> Result<Mirrors, reqwest::Error> {
+    let client = crate::build_client_with(resolver.clone(), STATUS_CONNECT_TIMEOUT)?;
+    fetch_from(&client, STATUS_URL, RETRY_BACKOFF).await
+}
+
+/// The body of [`fetch`], with the endpoint and the backoff base as
+/// parameters so the tests can drive it against a local server without
+/// sitting through the real ladder.
+async fn fetch_from(
+    client: &reqwest::Client,
+    url: &str,
+    backoff_base: Duration,
+) -> Result<Mirrors, reqwest::Error> {
+    let mut attempt = 1;
+    loop {
+        tracing::info!("Fetching the mirror list from {url} (attempt {attempt}/{FETCH_ATTEMPTS})");
+        let started = Instant::now();
+        let error = match fetch_once(client, url).await {
+            Ok(mirrors) => {
+                tracing::info!(
+                    "Fetched the mirror list in {:.2?} (attempt {attempt}/{FETCH_ATTEMPTS})",
+                    started.elapsed()
+                );
+                return Ok(mirrors);
+            }
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        let chain = DisplayErrorChain::new(&error);
+        if !is_retryable(&error) {
+            tracing::warn!(
+                "Attempt {attempt}/{FETCH_ATTEMPTS} at the mirror list failed after {elapsed:.2?} \
+                 and asking again cannot help: {chain}"
+            );
+            return Err(error);
+        }
+        if attempt == FETCH_ATTEMPTS {
+            tracing::warn!(
+                "Attempt {attempt}/{FETCH_ATTEMPTS} at the mirror list failed after \
+                 {elapsed:.2?}, out of attempts: {chain}"
+            );
+            return Err(error);
+        }
+        let backoff = backoff_base * (1 << (attempt - 1));
+        tracing::warn!(
+            "Attempt {attempt}/{FETCH_ATTEMPTS} at the mirror list failed after {elapsed:.2?}, \
+             retrying in {backoff:.2?}: {chain}"
+        );
+        tokio::time::sleep(backoff).await;
+        attempt += 1;
+    }
+}
+
+/// One request for the status document.
+///
+/// `error_for_status` is what keeps a 5xx from reaching the parser and
+/// surfacing as "expected value at line 1" — the status is both the honest
+/// diagnosis and the thing [`is_retryable`] reads.
+async fn fetch_once(client: &reqwest::Client, url: &str) -> Result<Mirrors, reqwest::Error> {
     client
-        .get(STATUS_URL)
+        .get(url)
         .timeout(FETCH_TIMEOUT)
         .send()
         .await?
+        .error_for_status()?
         .json()
         .await
 }
 
+/// Whether requesting the document again could plausibly change the answer.
+///
+/// A body that isn't the document we understand is a verdict, not an
+/// accident: it arrived intact, and re-downloading a few megabytes to parse
+/// them exactly the same way only delays the error the user needs to see. A
+/// 4xx is the same kind of answer from the other side. Everything else — a
+/// refused connection, a transfer cut mid-body, a timeout, a 5xx from an
+/// overloaded front end — is precisely what the retry exists for.
+fn is_retryable(error: &reqwest::Error) -> bool {
+    !error.is_decode()
+        && !error
+            .status()
+            .is_some_and(|status| status.is_client_error())
+}
+
 #[cfg(test)]
 pub(crate) mod test {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use super::*;
 
     /// A trimmed-down excerpt of the real `mirrors/status/json/` payload,
@@ -717,5 +858,115 @@ pub(crate) mod test {
             serde_json::from_str::<Mirrors>(&versionless).is_err(),
             "a missing version must be rejected"
         );
+    }
+
+    /// Base backoff for the retry tests: the ladder's shape is what's under
+    /// test, not its patience.
+    const TEST_BACKOFF: Duration = Duration::from_millis(10);
+
+    /// Serves one response per connection, `respond(hit)` deciding what the
+    /// `hit`-th request gets; `None` drops the connection unanswered, the
+    /// shape of a front end cutting a transfer off. Returns the bound
+    /// address and the live request count.
+    async fn spawn_scripted_server<F>(respond: F) -> (std::net::SocketAddr, Arc<AtomicUsize>)
+    where
+        F: Fn(usize) -> Option<String> + Send + Sync + 'static,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let served = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // Every response below closes the connection, so one accept
+                // is one request and the count needs no parsing to be right.
+                let response = respond(served.fetch_add(1, Ordering::SeqCst));
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    if let Some(response) = response {
+                        let _ = sock.write_all(response.as_bytes()).await;
+                    }
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    fn http_response(status_line: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The failure the retry exists for: the first attempt is cut off, the
+    /// second lands the document. A single blip must not cost the run.
+    #[tokio::test]
+    async fn a_cut_off_fetch_is_retried() {
+        let (addr, hits) = spawn_scripted_server(|hit| {
+            (hit > 0).then(|| http_response("200 OK", MIRRORS_EXCERPT))
+        })
+        .await;
+
+        let Mirrors::V3(mirrors) = fetch_from(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/"),
+            TEST_BACKOFF,
+        )
+        .await
+        .expect("the second attempt must land the document");
+
+        assert_eq!(mirrors.urls.len(), 4);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "one retry, not more");
+    }
+
+    /// A 5xx is retried like any other transient failure, and the ladder
+    /// stops at `FETCH_ATTEMPTS` rather than hammering the endpoint.
+    #[tokio::test]
+    async fn a_server_error_exhausts_the_attempts() {
+        let (addr, hits) =
+            spawn_scripted_server(|_| Some(http_response("503 Service Unavailable", ""))).await;
+
+        let error = fetch_from(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/"),
+            TEST_BACKOFF,
+        )
+        .await
+        .expect_err("a permanently unavailable endpoint must fail the fetch");
+
+        assert_eq!(
+            error.status().map(|status| status.as_u16()),
+            Some(503),
+            "the status is the diagnosis, not a parse error: {error}"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), FETCH_ATTEMPTS as usize);
+    }
+
+    /// A document that arrived intact and isn't the one we understand is an
+    /// answer: re-downloading megabytes to re-parse them identically would
+    /// only delay it.
+    #[tokio::test]
+    async fn a_malformed_document_is_not_retried() {
+        let (addr, hits) =
+            spawn_scripted_server(|_| Some(http_response("200 OK", "<html>nope</html>"))).await;
+
+        let error = fetch_from(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/"),
+            TEST_BACKOFF,
+        )
+        .await
+        .expect_err("a non-JSON body must fail the fetch");
+
+        assert!(error.is_decode(), "expected a decode failure, got {error}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a verdict is not retried");
     }
 }

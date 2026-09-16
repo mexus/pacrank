@@ -154,7 +154,7 @@ async fn discover_best_mirrors_async(
     let resolver = crate::dns::SurveyResolver::new();
     let client =
         crate::build_client(resolver.clone()).whatever_context("Can't build the HTTP client")?;
-    let mirrors = fetch_and_filter_mirrors(&client, countries).await?;
+    let mirrors = fetch_and_filter_mirrors(&resolver, countries).await?;
     let mirrors = resolve_phase(&resolver, mirrors).await?;
     let mirrors = latency_phase(&client, mirrors).await;
     let mirrors = compute_and_filter_pings(mirrors, ping_k)?;
@@ -167,10 +167,13 @@ async fn discover_best_mirrors_async(
 /// Phase 1: downloads the official mirrors list and filters it down to
 /// HTTP(S) mirrors in any of `countries` whose last sync is within 48h.
 pub(crate) async fn fetch_and_filter_mirrors(
-    client: &reqwest::Client,
+    resolver: &crate::dns::SurveyResolver,
     countries: &[CountryCode],
 ) -> Result<Vec<MirrorData<PingStatRunning>>, snafu::Whatever> {
-    let Mirrors::V3(mirrors) = crate::mirrors::fetch(client)
+    // Not the phase's shared client: the list is fetched through one of its
+    // own, built for a prerequisite rather than a measurement — see
+    // `mirrors::STATUS_CONNECT_TIMEOUT`.
+    let Mirrors::V3(mirrors) = crate::mirrors::fetch(resolver)
         .await
         .whatever_context("Can't fetch or parse the mirrors list")?;
     tracing::info!("Fetched {} mirrors", mirrors.urls.len());

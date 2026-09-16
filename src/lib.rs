@@ -90,6 +90,13 @@ pub fn tls_roots() -> Vec<reqwest::Certificate> {
 /// even complete a handshake within 2s has nothing worth measuring. Waits
 /// *after* the connection (headers, body) are bounded per consumer
 /// instead, where their budget belongs to the measurement being taken.
+///
+/// This is a *measurement* budget, and it belongs to mirrors alone. The one
+/// request that is not a measurement — the mirror list itself, without which
+/// there is no run at all — is far too important to give up on after 2s, and
+/// reqwest has no per-request connect timeout to loosen it with, so
+/// [`mirrors::fetch`] builds its own client through [`build_client_with`]
+/// (see `mirrors::STATUS_CONNECT_TIMEOUT`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// The shared HTTP client every network stage is built on: one UA, one
@@ -105,9 +112,23 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub fn build_client(
     resolver: crate::dns::SurveyResolver,
 ) -> Result<reqwest::Client, reqwest::Error> {
+    build_client_with(resolver, CONNECT_TIMEOUT)
+}
+
+/// [`build_client`] with the connect budget spelled out by the caller.
+///
+/// Every client in the crate is born here, which is what keeps the
+/// invariants the doc comment above lists from drifting apart: the connect
+/// timeout is the only dial a caller gets, and [`mirrors::fetch`] is the
+/// only caller that turns it — the mirror list is a prerequisite, not a
+/// measurement, so it must not be held to a measurement's patience.
+pub fn build_client_with(
+    resolver: crate::dns::SurveyResolver,
+    connect_timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .user_agent(APP_USER_AGENT)
-        .connect_timeout(CONNECT_TIMEOUT)
+        .connect_timeout(connect_timeout)
         .tls_certs_only(tls_roots())
         .dns_resolver(resolver)
         .build()

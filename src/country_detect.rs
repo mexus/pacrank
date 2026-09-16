@@ -351,7 +351,10 @@ async fn survey(
     client: &reqwest::Client,
     resolver: &SurveyResolver,
 ) -> Result<Vec<Sample>, DetectError> {
-    let Mirrors::V3(mirrors) = crate::mirrors::fetch(client)
+    // The list comes in over its own client (see
+    // `mirrors::STATUS_CONNECT_TIMEOUT`); `client` here is the one that
+    // pings, and both share `resolver`'s cache.
+    let Mirrors::V3(mirrors) = crate::mirrors::fetch(resolver)
         .await
         .context(FetchMirrorsSnafu)?;
 
