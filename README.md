@@ -29,7 +29,8 @@ many output modes. pacrank takes a narrower shape on purpose:
   an atomic `rename(2)` that preserves the original file mode. No root
   process is alive while the measurements run — the escalations bracket
   them instead. You don't compose this yourself with `sudo` and shell
-  redirection.
+  redirection. See [Privileges](#privileges) for why the measurements run
+  under an account that isn't yours.
 
 Reach for reflector when you want configurability and a rich set of output
 options. Reach for pacrank when you want one command that gives you an
@@ -168,6 +169,25 @@ for.
 
 Already root (`sudo pacrank`)? Then there is nothing to shorten — the
 worker is spawned directly and the parent writes the file itself.
+
+**Why `nobody`, and not just your own user?** The parent is unprivileged
+already, so the extra hop looks redundant — until you look at what the
+worker parses. `core.db` arrives from whichever mirror is being measured,
+its compression is picked by sniffing the file's own magic bytes, and the
+zstd branch of that choice is a C library (`zstd-sys`). The mirror list
+carries plain `http://` entries too, so those bytes need not even come from
+the mirror operator to begin with. The rest of the pipeline — hyper,
+rustls, serde_json, tar — is Rust, and rustls reaches C only through
+hardened crypto primitives; that decompressor is the one place where a
+whole attacker-chosen file meets a general-purpose C parser, and it runs
+exclusively in the worker. As `nobody` it cannot read your SSH or GPG keys,
+reach your browser session, or append a line to your shell rc files. As
+you, it could do all three.
+
+The drop itself is `setgroups` → `setgid` → `setuid`, in that order.
+Neither of the last two touches the supplementary group vector, so without
+the first the worker would keep the one it inherited — which, under sudo,
+is root's.
 
 ## Development
 

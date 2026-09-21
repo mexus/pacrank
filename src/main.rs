@@ -455,9 +455,17 @@ fn drop_privileges() -> Result<(), snafu::Whatever> {
         .whatever_context("System error during 'nobody' user lookup")?
         .whatever_context("The 'nobody' user doesn't exist")?;
 
-    // Rule of thumb: ALWAYS drop GID before UID.
-    // Once you drop the user ID to a non-root user, the OS will
-    // revoke your permission to change the group ID!
+    // Rule of thumb: ALWAYS drop the supplementary groups first, then the
+    // GID, then the UID. Once you drop the user ID to a non-root user, the
+    // OS will revoke your permission to change either of the other two!
+    //
+    // `setgroups` is the step that is easy to miss, because neither
+    // `setgid` nor `setuid` touches the supplementary group vector: without
+    // it the worker keeps whatever vector it inherited, and under sudo that
+    // vector is root's. A `nobody` worker carrying group 0 into every file
+    // access it makes is not the sandbox this function advertises.
+    nix::unistd::setgroups(&[user.gid])
+        .whatever_context("CRITICAL SECURITY FAILURE: Could not drop supplementary groups")?;
     nix::unistd::setgid(user.gid)
         .whatever_context("CRITICAL SECURITY FAILURE: Could not drop group privileges")?;
     nix::unistd::setuid(user.uid)
