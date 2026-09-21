@@ -24,10 +24,11 @@ many output modes. pacrank takes a narrower shape on purpose:
   split your local bandwidth across workers and distort each mirror's
   number; a sequential probe tells you what a real `pacman -Sy` will see on
   your link.
-- **Privilege handling is the tool's job, not yours.** pacrank escalates
-  through `sudo`, drops to `nobody` before opening a single socket, and
-  replaces the mirrorlist with an atomic `rename(2)` that preserves the
-  original file mode. You don't compose this yourself with `sudo` and shell
+- **Privilege handling is the tool's job, not yours.** pacrank drops to
+  `nobody` before opening a single socket and replaces the mirrorlist with
+  an atomic `rename(2)` that preserves the original file mode. No root
+  process is alive while the measurements run — the escalations bracket
+  them instead. You don't compose this yourself with `sudo` and shell
   redirection.
 
 Reach for reflector when you want configurability and a rich set of output
@@ -87,10 +88,12 @@ pacrank
 
 With no flags, pacrank auto-detects your closest countries by
 sample-pinging the global mirror list, then sudo prompts for your password
-(see [Privileges](#privileges) below), the latency and download phases
-run, and `/etc/pacman.d/mirrorlist` is rewritten with the top picks. The
-detected countries are cached under `$XDG_CACHE_HOME/pacrank/countries.json`
-(or `~/.cache/pacrank/countries.json`) and reused as long as your public IP
+(see [Privileges](#privileges) below), the latency and download phases run,
+and `/etc/pacman.d/mirrorlist` is rewritten with the top picks — which takes
+one more sudo, silent unless your timestamp expired while the phases were
+running. The detected countries are cached under
+`$XDG_CACHE_HOME/pacrank/countries.json` (or
+`~/.cache/pacrank/countries.json`) and reused as long as your public IP
 prefix is unchanged and the entry is fresh.
 
 If you'd rather pick countries yourself, pass `--country` (repeat the flag
@@ -131,30 +134,40 @@ Country auto-detection (only used when `--country` is not passed):
   (always re-detect, never persist)
 
 Log level follows `RUST_LOG` (e.g. `RUST_LOG=debug`); the variable survives
-the sudo step.
+the sudo steps.
 
 ## Privileges
 
 Rewriting `/etc/pacman.d/mirrorlist` needs root, but the network I/O that
 fills it is a much larger attack surface than an atomic rename. So root is
-confined to the file write itself:
+confined to the file write itself — and, just as much, to the moment of it.
+Invoked as a regular user, pacrank stays unprivileged from start to finish
+and spawns two short-lived root children instead:
 
-1. Invoked as a regular user, the binary re-execs itself through
-   `/usr/bin/sudo` (absolute path — a PATH-planted `sudo` lookalike must
-   not intercept us).
-2. The root copy spawns itself again with `--worker`, which immediately
-   `setgid`/`setuid`s to `nobody` before opening a single socket.
-3. The `nobody` worker does all the HTTP — mirrors list, latency probes,
-   `core.db` downloads, package downloads — and prints the selected URLs
-   to stdout as JSON.
-4. The root parent reads the JSON and atomically replaces the mirrorlist:
-   write to a `NamedTempFile` in `/etc/pacman.d/`, `fsync`, copy the old
-   file's mode onto it, `rename(2)` into place.
+1. The parent runs country auto-detection as you, then spawns
+   `sudo pacrank --worker` (absolute path — a PATH-planted `sudo` lookalike
+   must not intercept us). That child is root only until it
+   `setgid`/`setuid`s to `nobody`, which it does before opening a single
+   socket. Escalating at all is what buys the sandbox: dropping to `nobody`
+   is itself a privileged operation.
+2. The `nobody` worker does all the HTTP — mirrors list, latency probes,
+   `core.db` downloads, package downloads — and prints the selected URLs to
+   stdout as JSON. This is the slow part, and no privileged process is
+   attached to it.
+3. The unprivileged parent reads that JSON and spawns `sudo pacrank
+   --apply`, piping the mirrors into its stdin. That child atomically
+   replaces the mirrorlist — write to a `NamedTempFile` in
+   `/etc/pacman.d/`, `fsync`, copy the old file's mode onto it, `rename(2)`
+   into place — and exits.
 
-A `PACRANK_ESCALATED` env var is set on the sudo child and checked
-on the way in to break any hypothetical escalation loop.
+Each root process therefore lives for milliseconds rather than for the
+minutes the measurements take. The cost is that `sudo` runs twice: the
+second call is silent while your sudo timestamp is still valid, and prompts
+again if the run outlived it. Both escalations say in the log what they are
+for.
 
-Already root? Step 1 is skipped and execution jumps straight to step 2.
+Already root (`sudo pacrank`)? Then there is nothing to shorten — the
+worker is spawned directly and the parent writes the file itself.
 
 ## Development
 

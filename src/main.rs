@@ -58,6 +58,11 @@ struct Args {
     #[arg(long, hide(true))]
     worker: bool,
 
+    /// Installs the mirror list handed over as JSON on stdin. The only
+    /// branch that needs root; the parent spawns it under sudo.
+    #[arg(long, hide(true))]
+    apply: bool,
+
     /// Emit a shell completion script to stdout and exit.
     #[arg(long, value_name = "SHELL", value_enum, hide = true, exclusive = true)]
     generate_completions: Option<clap_complete::Shell>,
@@ -70,6 +75,7 @@ fn main() -> Result<(), snafu::Whatever> {
         dl_k,
         dry_run,
         worker,
+        apply,
         mut country,
         detect_baseline_n,
         detect_threshold,
@@ -96,6 +102,13 @@ fn main() -> Result<(), snafu::Whatever> {
 
     init_tracing();
 
+    // The privileged tail of a run, spawned by `install_via_sudo` below. It
+    // needs nothing but the JSON on its stdin, so it returns here — before
+    // country resolution could drag a network survey into the root branch.
+    if apply {
+        return run_apply();
+    }
+
     // Country auto-detection runs in the user-context parent only — never
     // in the worker, which receives the resolved list via argv. Doing it
     // here guarantees the cache lands under the invoking user's HOME, not
@@ -121,13 +134,16 @@ fn main() -> Result<(), snafu::Whatever> {
         "No countries available — pass --country/-c explicitly."
     );
 
-    // Three modes of operation:
+    // The remaining modes of operation (`--apply` returned above):
     //   - dry-run:   drop to `nobody`, run the discovery, print results.
     //   - --worker:  same as dry-run but emits JSON to stdout for the parent.
-    //   - default:   (re-)escalate to root, then spawn self with `--worker`,
-    //                read its JSON stdout, and write `/etc/pacman.d/mirrorlist`.
+    //   - default:   spawn the `--worker` child, read its JSON stdout, then
+    //                hand the winners to an `--apply` child that writes
+    //                `/etc/pacman.d/mirrorlist`.
     // The split keeps network I/O unprivileged while isolating the file
-    // rewrite in a minimal privileged branch.
+    // rewrite in a minimal privileged branch — one that, started from an
+    // unprivileged parent, only comes into existence once the measurements
+    // are over.
     if dry_run {
         run_dry_run(dl_k, ping_k, &country)
     } else if worker {
@@ -136,7 +152,7 @@ fn main() -> Result<(), snafu::Whatever> {
         // Only a list we resolved ourselves needs injecting into the child's
         // argv; an explicit `-c` is already part of `env::args()`.
         let injected: &[CountryCode] = if auto_detected { &country } else { &[] };
-        run_privileged(&forwarded_args(injected))
+        run_update(&forwarded_args(injected))
     }
 }
 
@@ -166,15 +182,15 @@ fn validate_detect_threshold(threshold: f64) -> Result<(), snafu::Whatever> {
     Ok(())
 }
 
-/// Builds the argv to forward to a child process (sudo re-exec or
-/// `--worker` subprocess) — our own arguments minus `argv[0]`, with each
-/// country in `injected` appended as `-c <CODE>`.
+/// Builds the argv to forward to the `--worker` subprocess — our own
+/// arguments minus `argv[0]`, with each country in `injected` appended as
+/// `-c <CODE>`.
 ///
-/// Injecting the countries here means the child sees a fully specified
+/// Injecting the countries here means the worker sees a fully specified
 /// `--country` list and never re-runs auto-detection itself. Only the ones
 /// *this* process auto-detected belong in `injected`: an explicit `-c` is
-/// already part of `env::args()`, and appending it again would hand the child
-/// a doubled list, one extra copy per hop (parent → sudo child → worker).
+/// already part of `env::args()`, and appending it again would hand the
+/// worker a doubled list.
 fn forwarded_args(injected: &[CountryCode]) -> Vec<String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     for cc in injected {
@@ -226,62 +242,133 @@ fn run_worker(
     Ok(())
 }
 
-/// Privileged parent entry point: make sure we're root, spawn an unprivileged
-/// worker, and atomically replace `/etc/pacman.d/mirrorlist` with the result.
-fn run_privileged(child_args: &[String]) -> Result<(), snafu::Whatever> {
-    escalate_if_needed(child_args)?;
-    let mirrors = spawn_worker_and_read_mirrors(child_args)?;
-    write_mirrorlist(&mirrors)?;
-    Ok(())
+/// Privileged entry point: installs the mirror list handed to us on stdin.
+///
+/// The only branch that runs as root, and it lives for one `rename(2)`: it
+/// opens no socket, detects no country and trusts nothing but the JSON its
+/// parent wrote into the pipe.
+fn run_apply() -> Result<(), snafu::Whatever> {
+    snafu::ensure_whatever!(
+        nix::unistd::Uid::effective().is_root(),
+        "--apply needs root; the parent spawns it under sudo."
+    );
+    let mirrors: Vec<Url> = serde_json::from_reader(std::io::stdin().lock())
+        .whatever_context("Can't parse the mirrors handed over on stdin")?;
+    // An empty list would leave pacman with no servers at all. The pipeline
+    // never produces one, so this guards against a broken hand-over rather
+    // than an expected outcome.
+    snafu::ensure_whatever!(
+        !mirrors.is_empty(),
+        "Refusing to install an empty mirror list"
+    );
+    write_mirrorlist(&mirrors)
 }
 
-// ---------- Privileged parent helpers ----------
-
-/// Re-execs the process under sudo when the effective UID isn't root.
+/// Default entry point: measure in a sandboxed worker, then install the
+/// winners.
 ///
-/// If escalation happens, this function does not return — it exits the
-/// current process with the sudo child's exit code. On the already-root path
-/// it simply returns `Ok(())`.
-fn escalate_if_needed(child_args: &[String]) -> Result<(), snafu::Whatever> {
-    if nix::unistd::Uid::effective().is_root() {
-        return Ok(());
+/// Root is never held across the measurement. Invoked as a regular user,
+/// each half gets a sudo child of its own: one that lives just long enough
+/// to reach `setuid(nobody)`, one that lives just long enough to rename a
+/// file. The minutes of network I/O in between have no privileged process
+/// attached to them at all.
+///
+/// The price is a second `sudo`, which prompts again when the run outlives
+/// the sudo timestamp — hence the two escalations logging what they are for
+/// rather than a bare "escalating".
+fn run_update(child_args: &[String]) -> Result<(), snafu::Whatever> {
+    // Already root (`sudo pacrank`): the worker is ours to spawn directly,
+    // and installing needs no second process at all. Nothing can shorten
+    // root's lifetime on this path — the user handed it to us for the whole
+    // run.
+    let escalate = !nix::unistd::Uid::effective().is_root();
+    let mirrors = spawn_worker_and_read_mirrors(child_args, escalate)?;
+    if escalate {
+        install_via_sudo(&mirrors)
+    } else {
+        write_mirrorlist(&mirrors)
     }
-    // `PACRANK_ESCALATED` is a loop-breaker: the sudo child sets it and
-    // preserves it across the exec, so if we somehow land here again with a
-    // non-root euid we abort instead of spinning forever.
-    snafu::ensure_whatever!(
-        std::env::var("PACRANK_ESCALATED").is_err(),
-        "The privileges has already been escalated, but the effective user is still \
-        non-root. Breaking the cycle!"
-    );
-    tracing::info!("Escalating privileges with sudo");
+}
+
+// ---------- Child process helpers ----------
+
+/// Builds a [`Command`] that re-runs this binary, behind `/usr/bin/sudo`
+/// when `escalate` is set.
+///
+/// Both paths are absolute on purpose: `current_exe` resolves ours, and a
+/// PATH-planted `sudo` lookalike must not intercept the other.
+fn self_command(escalate: bool) -> Result<Command, snafu::Whatever> {
     let current_exe =
         std::env::current_exe().whatever_context("Can't get current executable path")?;
-    // Absolute path matches the care taken with `current_exe` — a
-    // PATH-planted `sudo` must not intercept us.
-    let status = Command::new("/usr/bin/sudo")
-        .env("PACRANK_ESCALATED", "1")
-        // Preserve `RUST_LOG` so the user's log-filter survives the
-        // privilege jump; sudo's default env_reset would otherwise drop it.
-        .arg("--preserve-env=RUST_LOG,PACRANK_ESCALATED")
-        .arg(current_exe)
-        .args(child_args)
-        .status()
+    if !escalate {
+        return Ok(Command::new(current_exe));
+    }
+    let mut command = Command::new("/usr/bin/sudo");
+    // Preserve `RUST_LOG` so the user's log-filter survives the privilege
+    // jump; sudo's default env_reset would otherwise drop it.
+    command.arg("--preserve-env=RUST_LOG").arg(current_exe);
+    Ok(command)
+}
+
+/// Hands the winning mirrors to a short-lived root child over a pipe.
+///
+/// argv would carry a handful of public URLs just as well, but stdin reuses
+/// the JSON codec the worker already speaks — same types, direction flipped
+/// — and taking it costs the child nothing: sudo reads the password from
+/// the terminal, not from the stdin we occupy here.
+fn install_via_sudo(mirrors: &[Url]) -> Result<(), snafu::Whatever> {
+    tracing::info!("Escalating privileges with sudo to update the mirror list");
+    // `--apply` is the entire argv: the mirrors arrive on stdin, and
+    // forwarding the rest of ours would only hand the root branch flags it
+    // must not act on.
+    let mut child = self_command(true)?
+        .arg("--apply")
+        .stdin(Stdio::piped())
+        .spawn()
         .whatever_context("Failed to execute sudo; install sudo or re-run as root")?;
-    std::process::exit(status.code().unwrap_or(1));
+    let mut stdin = child.stdin.take().expect("Stdin is piped");
+    let handover = serde_json::to_writer(&mut stdin, mirrors);
+    // The child reads to EOF before it touches `/etc`, so the pipe has to be
+    // closed before we start waiting on its exit code.
+    drop(stdin);
+    let status = child
+        .wait()
+        .whatever_context("Can't wait for the privileged child")?;
+    // Reported before the hand-over: a refused authentication reaps sudo
+    // before the child can drain the pipe, and "the escalation failed" is
+    // the honest diagnosis of the broken pipe that follows from it.
+    snafu::ensure_whatever!(
+        status.success(),
+        "Updating the mirror list failed ({status})"
+    );
+    handover.whatever_context("Can't hand the mirrors over to the privileged child")?;
+    Ok(())
 }
 
 /// Spawns this binary with `--worker`, collects its stdout, and decodes the
 /// JSON-encoded list of winning mirror URLs.
-fn spawn_worker_and_read_mirrors(child_args: &[String]) -> Result<Vec<Url>, snafu::Whatever> {
-    let current_exe =
-        std::env::current_exe().whatever_context("Can't get current executable path")?;
-    let child = Command::new(current_exe)
+///
+/// The worker needs root only in order to give it up: `setuid` to `nobody`
+/// is itself a privileged operation, so an unprivileged parent has to
+/// escalate to build the sandbox it wants — and that child reaches the
+/// syscall within milliseconds of exec.
+fn spawn_worker_and_read_mirrors(
+    child_args: &[String],
+    escalate: bool,
+) -> Result<Vec<Url>, snafu::Whatever> {
+    if escalate {
+        tracing::info!("Escalating privileges with sudo to sandbox the worker as 'nobody'");
+    }
+    let child = self_command(escalate)?
         .args(child_args)
         .arg("--worker")
         .stdout(Stdio::piped())
         .spawn()
-        .whatever_context("Can't spawn an unprivileged worker")?;
+        .whatever_context(if escalate {
+            "Can't spawn the worker under sudo; install sudo or re-run as root"
+        } else {
+            "Can't spawn an unprivileged worker"
+        })?;
     let worker_output = child
         .wait_with_output()
         .whatever_context("Can't receive output from the worker")?;
