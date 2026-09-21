@@ -108,7 +108,7 @@ pacrank --country DE --country NL --country FR
 
 Dry run — nothing written, and the country cache left alone. The
 measurements still happen inside the `nobody` sandbox, which is what its
-one sudo prompt pays for:
+one sudo prompt pays for ([how to remove it](#passwordless-sandboxing)):
 
 ```
 pacrank --dry-run
@@ -139,8 +139,9 @@ Country auto-detection (only used when `--country` is not passed):
 - `--no-country-cache` — bypass the country cache for this invocation
   (always re-detect, never persist)
 
-Log level follows `RUST_LOG` (e.g. `RUST_LOG=debug`); the variable survives
-the sudo steps.
+Log level follows `RUST_LOG` (e.g. `RUST_LOG=debug`). The parent passes its
+filter to each child on the command line, so it survives the sudo steps
+without asking sudo to preserve anything.
 
 ## Privileges
 
@@ -179,9 +180,10 @@ worker is spawned directly and the parent writes the file itself.
 worker, prints what it would have installed, and never brings an `--apply`
 child into existence. Writing nothing is not the same as touching nothing
 — a dry run downloads and parses exactly what a real run does — so it is
-sandboxed exactly like one. `--no-sandbox` is the way out of the prompt it
-costs: it measures in the process you started, as you, and says so in the
-log.
+sandboxed exactly like one. Its prompt can be removed for good (see
+[Passwordless sandboxing](#passwordless-sandboxing)), or traded away for
+the run with `--no-sandbox`, which measures in the process you started, as
+you, and says so in the log.
 
 **Why `nobody`, and not just your own user?** The parent is unprivileged
 already, so the extra hop looks redundant — until you look at what the
@@ -201,6 +203,43 @@ The drop itself is `setgroups` → `setgid` → `setuid`, in that order.
 Neither of the last two touches the supplementary group vector, so without
 the first the worker would keep the one it inherited — which, under sudo,
 is root's.
+
+### Passwordless sandboxing
+
+The worker is an escalation you pay for and get no writes out of: it holds
+root only long enough to reach `setuid(nobody)`. That one is safe to hand
+out without a password — and doing so is what makes a sandboxed `--dry-run`
+silent:
+
+```
+# sudo visudo -f /etc/sudoers.d/pacrank
+mexus ALL=(root) NOPASSWD: /usr/bin/pacrank ^--worker( .*)?$
+```
+
+Replace `mexus` with your login (or `%wheel` for the group), and confirm
+the path with `readlink -f "$(command -v pacrank)"` — the rule has to name
+the binary pacrank re-executes. The regular-expression form needs sudo
+1.9.10 or newer; on anything older, `/usr/bin/pacrank --worker *` does the
+same job. No `SETENV` tag is needed, which is why pacrank passes its log
+filter on the command line instead of through the environment.
+
+**Only ever aim a rule like this at a binary you cannot write.**
+`/usr/bin/pacrank` from the AUR package qualifies; a `~/.cargo/bin/pacrank`
+does not. A NOPASSWD rule on a file you can overwrite is a passwordless
+root shell, whatever that file happens to contain today.
+
+What the rule grants is bounded by what `--worker` is able to do: it writes
+no file, it drops to `nobody` before its first socket, and it refuses to
+share a command line with `--apply` — so the trailing wildcard, which in
+sudoers matches whitespace and therefore whole extra arguments, cannot be
+bent into a free mirrorlist rewrite. Everything else it matches is a
+measurement parameter.
+
+`--apply` stays out of the rule on purpose. It is the branch that writes to
+`/etc`, and the password in front of it is the point. With the rule in
+place an update prompts once, at the end, rather than once up front and
+possibly again later when the measurements outlive your sudo timestamp —
+and a dry run stops prompting at all.
 
 ## Development
 

@@ -65,8 +65,27 @@ struct Args {
 
     /// Installs the mirror list handed over as JSON on stdin. The only
     /// branch that needs root; the parent spawns it under sudo.
-    #[arg(long, hide(true))]
+    ///
+    /// Refusing to share an argv with the unprivileged modes is what makes
+    /// the NOPASSWD sudoers rule in the README safe to write: the trailing
+    /// wildcard such a rule needs matches any argument, `--apply` included,
+    /// so clap has to be what turns it down.
+    #[arg(long, hide(true), conflicts_with_all = ["worker", "dry_run"])]
     apply: bool,
+
+    /// Tracing filter for this process, in `RUST_LOG` syntax.
+    ///
+    /// How the parent hands its own filter to the children: sudo resets the
+    /// environment, and preserving a variable across it would make every
+    /// NOPASSWD rule for pacrank need a `SETENV` tag as well. A `RUST_LOG`
+    /// that did survive into this process still wins.
+    ///
+    /// Self-overriding because the parent appends it to an argv that may
+    /// already carry one: clap rejects a repeated argument otherwise, and
+    /// `pacrank --log-filter debug` would fail the moment it forwarded
+    /// itself to a child.
+    #[arg(long, hide(true), value_name = "SPEC", overrides_with = "log_filter")]
+    log_filter: Option<String>,
 
     /// Emit a shell completion script to stdout and exit.
     #[arg(long, value_name = "SHELL", value_enum, hide = true, exclusive = true)]
@@ -82,6 +101,7 @@ fn main() -> Result<(), snafu::Whatever> {
         no_sandbox,
         worker,
         apply,
+        log_filter,
         mut country,
         detect_baseline_n,
         detect_threshold,
@@ -106,7 +126,12 @@ fn main() -> Result<(), snafu::Whatever> {
     // same comparison and is rejected here too.)
     validate_detect_threshold(detect_threshold)?;
 
-    init_tracing();
+    init_tracing(log_filter.as_deref());
+    // Resolved once, then spelled out on every child's command line. The
+    // environment is not an option: sudo wipes it, and asking it not to
+    // would put a `SETENV` tag in the sudoers rule of anyone who skips the
+    // password for the worker.
+    let log_filter = log_filter.or_else(|| std::env::var("RUST_LOG").ok());
 
     // The privileged tail of a run, spawned by `install_via_sudo` below. It
     // needs nothing but the JSON on its stdin, so it returns here — before
@@ -160,23 +185,26 @@ fn main() -> Result<(), snafu::Whatever> {
         // Only a list we resolved ourselves needs injecting into the child's
         // argv; an explicit `-c` is already part of `env::args()`.
         let injected: &[CountryCode] = if auto_detected { &country } else { &[] };
-        let child_args = forwarded_args(injected);
+        let child_args = forwarded_args(injected, log_filter.as_deref());
         if dry_run {
             run_dry_run(dl_k, ping_k, &country, &child_args, !no_sandbox)
         } else {
-            run_update(&child_args)
+            run_update(&child_args, log_filter.as_deref())
         }
     }
 }
 
-fn init_tracing() {
+fn init_tracing(log_filter: Option<&str>) {
+    let builder = EnvFilter::builder().with_default_directive(LevelFilter::INFO.into());
+    // `RUST_LOG` wherever it survived, the flag where it didn't — which is
+    // every child we spawn through sudo.
+    let filter = match log_filter {
+        Some(spec) if std::env::var_os("RUST_LOG").is_none() => builder.parse_lossy(spec),
+        _ => builder.from_env_lossy(),
+    };
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy(),
-        )
+        .with(filter)
         .init();
 }
 
@@ -197,18 +225,26 @@ fn validate_detect_threshold(threshold: f64) -> Result<(), snafu::Whatever> {
 
 /// Builds the argv to forward to the `--worker` subprocess — our own
 /// arguments minus `argv[0]`, with each country in `injected` appended as
-/// `-c <CODE>`.
+/// `-c <CODE>` and the log filter, if any, as `--log-filter <SPEC>`.
 ///
 /// Injecting the countries here means the worker sees a fully specified
 /// `--country` list and never re-runs auto-detection itself. Only the ones
 /// *this* process auto-detected belong in `injected`: an explicit `-c` is
 /// already part of `env::args()`, and appending it again would hand the
 /// worker a doubled list.
-fn forwarded_args(injected: &[CountryCode]) -> Vec<String> {
+///
+/// A `--log-filter` the user spelled out is already in `env::args()` too,
+/// and appending it again is harmless where a doubled country list isn't:
+/// the flag takes a single value, and the last occurrence wins.
+fn forwarded_args(injected: &[CountryCode], log_filter: Option<&str>) -> Vec<String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     for cc in injected {
         args.push("-c".to_string());
         args.push(cc.as_code().to_string());
+    }
+    if let Some(spec) = log_filter {
+        args.push("--log-filter".to_string());
+        args.push(spec.to_string());
     }
     args
 }
@@ -309,7 +345,7 @@ fn run_apply() -> Result<(), snafu::Whatever> {
 /// The price is a second `sudo`, which prompts again when the run outlives
 /// the sudo timestamp — hence the two escalations logging what they are for
 /// rather than a bare "escalating".
-fn run_update(child_args: &[String]) -> Result<(), snafu::Whatever> {
+fn run_update(child_args: &[String], log_filter: Option<&str>) -> Result<(), snafu::Whatever> {
     // Already root (`sudo pacrank`): the worker is ours to spawn directly,
     // and installing needs no second process at all. Nothing can shorten
     // root's lifetime on this path — the user handed it to us for the whole
@@ -317,7 +353,7 @@ fn run_update(child_args: &[String]) -> Result<(), snafu::Whatever> {
     let escalate = !nix::unistd::Uid::effective().is_root();
     let mirrors = spawn_worker_and_read_mirrors(child_args, escalate)?;
     if escalate {
-        install_via_sudo(&mirrors)
+        install_via_sudo(&mirrors, log_filter)
     } else {
         write_mirrorlist(&mirrors)
     }
@@ -337,9 +373,11 @@ fn self_command(escalate: bool) -> Result<Command, snafu::Whatever> {
         return Ok(Command::new(current_exe));
     }
     let mut command = Command::new("/usr/bin/sudo");
-    // Preserve `RUST_LOG` so the user's log-filter survives the privilege
-    // jump; sudo's default env_reset would otherwise drop it.
-    command.arg("--preserve-env=RUST_LOG").arg(current_exe);
+    // No `--preserve-env`: the log filter travels on the command line
+    // instead. Asking sudo to carry an environment variable across would
+    // oblige anyone writing a NOPASSWD rule for pacrank to grant `SETENV`
+    // too, and that tag is worth more than a log level.
+    command.arg(current_exe);
     Ok(command)
 }
 
@@ -349,13 +387,17 @@ fn self_command(escalate: bool) -> Result<Command, snafu::Whatever> {
 /// the JSON codec the worker already speaks — same types, direction flipped
 /// — and taking it costs the child nothing: sudo reads the password from
 /// the terminal, not from the stdin we occupy here.
-fn install_via_sudo(mirrors: &[Url]) -> Result<(), snafu::Whatever> {
+fn install_via_sudo(mirrors: &[Url], log_filter: Option<&str>) -> Result<(), snafu::Whatever> {
     tracing::info!("Escalating privileges with sudo to update the mirror list");
-    // `--apply` is the entire argv: the mirrors arrive on stdin, and
-    // forwarding the rest of ours would only hand the root branch flags it
-    // must not act on.
-    let mut child = self_command(true)?
-        .arg("--apply")
+    // `--apply` and the log filter are the entire argv: the mirrors arrive
+    // on stdin, and forwarding the rest of ours would only hand the root
+    // branch flags it must not act on.
+    let mut command = self_command(true)?;
+    command.arg("--apply");
+    if let Some(spec) = log_filter {
+        command.args(["--log-filter", spec]);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .spawn()
         .whatever_context("Failed to execute sudo; install sudo or re-run as root")?;
@@ -392,9 +434,12 @@ fn spawn_worker_and_read_mirrors(
     if escalate {
         tracing::info!("Escalating privileges with sudo to sandbox the worker as 'nobody'");
     }
+    // `--worker` leads the argv so that a sudoers rule can pin it there:
+    // `/usr/bin/pacrank --worker *` grants the sandbox and nothing else,
+    // whereas a rule that had to wildcard the front would grant everything.
     let child = self_command(escalate)?
-        .args(child_args)
         .arg("--worker")
+        .args(child_args)
         .stdout(Stdio::piped())
         .spawn()
         .whatever_context(if escalate {
@@ -511,6 +556,28 @@ mod test {
     use clap::Parser as _;
 
     use super::{Args, validate_detect_threshold};
+
+    /// The parent appends its own `--log-filter` to an argv it otherwise
+    /// forwards verbatim, so a user who passed the flag explicitly makes it
+    /// appear twice. Ours goes last and has to win — if clap ever started
+    /// rejecting the repeat instead, every `--log-filter` run would die.
+    #[test]
+    fn a_repeated_log_filter_keeps_the_last_value() {
+        let args = Args::parse_from(["pacrank", "--log-filter", "info", "--log-filter", "debug"]);
+        assert_eq!(args.log_filter.as_deref(), Some("debug"));
+    }
+
+    /// The NOPASSWD sudoers rule the README documents ends in a wildcard,
+    /// and sudo's wildcards match whitespace — so `--worker *` matches
+    /// `--worker --apply` too. Nothing but this refusal stands between that
+    /// rule and a passwordless rewrite of `/etc/pacman.d/mirrorlist`.
+    #[test]
+    fn apply_refuses_to_share_an_argv_with_the_unprivileged_modes() {
+        for mode in ["--worker", "--dry-run"] {
+            Args::try_parse_from(["pacrank", "--apply", mode])
+                .expect_err(&format!("--apply must not be combined with {mode}"));
+        }
+    }
 
     /// `--no-sandbox` only describes what a dry run does; on an update the
     /// worker is spawned by a parent that has to escalate for `--apply`
