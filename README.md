@@ -106,7 +106,9 @@ applied to the combined pool, not per-country:
 pacrank --country DE --country NL --country FR
 ```
 
-Dry run — no sudo, nothing written, and the country cache is left alone:
+Dry run — nothing written, and the country cache left alone. The
+measurements still happen inside the `nobody` sandbox, which is what its
+one sudo prompt pays for:
 
 ```
 pacrank --dry-run
@@ -121,7 +123,10 @@ pacrank --dry-run
 - `--ping-k N` — keep the N lowest-latency mirrors after the ping phase (default 10)
 - `--dl-k N` — keep the N fastest-download mirrors for the final list (default 5)
 - `--dry-run` — run both phases, print results, don't touch the mirrorlist
-  or the country cache
+  or the country cache. Still escalates once to build the sandbox: a dry
+  run downloads and parses exactly what a real one does
+- `--no-sandbox` — with `--dry-run` only: measure in this very process, as
+  you, with no sudo prompt and no `nobody` to contain a hostile `core.db`
 
 Country auto-detection (only used when `--country` is not passed):
 
@@ -170,6 +175,14 @@ for.
 Already root (`sudo pacrank`)? Then there is nothing to shorten — the
 worker is spawned directly and the parent writes the file itself.
 
+`--dry-run` takes step 1 and stops before step 3: it spawns the sandboxed
+worker, prints what it would have installed, and never brings an `--apply`
+child into existence. Writing nothing is not the same as touching nothing
+— a dry run downloads and parses exactly what a real run does — so it is
+sandboxed exactly like one. `--no-sandbox` is the way out of the prompt it
+costs: it measures in the process you started, as you, and says so in the
+log.
+
 **Why `nobody`, and not just your own user?** The parent is unprivileged
 already, so the extra hop looks redundant — until you look at what the
 worker parses. `core.db` arrives from whichever mirror is being measured,
@@ -179,10 +192,10 @@ carries plain `http://` entries too, so those bytes need not even come from
 the mirror operator to begin with. The rest of the pipeline — hyper,
 rustls, serde_json, tar — is Rust, and rustls reaches C only through
 hardened crypto primitives; that decompressor is the one place where a
-whole attacker-chosen file meets a general-purpose C parser, and it runs
-exclusively in the worker. As `nobody` it cannot read your SSH or GPG keys,
-reach your browser session, or append a line to your shell rc files. As
-you, it could do all three.
+whole attacker-chosen file meets a general-purpose C parser, and every mode
+but `--no-sandbox` reaches it from inside the worker. As `nobody` it cannot
+read your SSH or GPG keys, reach your browser session, or append a line to
+your shell rc files. As you, it could do all three.
 
 The drop itself is `setgroups` → `setgid` → `setuid`, in that order.
 Neither of the last two touches the supplementary group vector, so without

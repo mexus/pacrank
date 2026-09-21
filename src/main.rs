@@ -31,6 +31,11 @@ struct Args {
     /// Whether to run the checks but don't save anything.
     #[arg(long, short)]
     dry_run: bool,
+    /// Measure without the `nobody` sandbox: no sudo, no password prompt,
+    /// and a hostile mirror's `core.db` parsed with your own privileges
+    /// rather than nobody's. Only meaningful together with `--dry-run`.
+    #[arg(long, requires = "dry_run")]
+    no_sandbox: bool,
 
     /// Limit mirrors to these countries. Pass the flag multiple times for
     /// more than one (e.g. `-c US -c DE`). When omitted, the closest
@@ -74,6 +79,7 @@ fn main() -> Result<(), snafu::Whatever> {
         ping_k,
         dl_k,
         dry_run,
+        no_sandbox,
         worker,
         apply,
         mut country,
@@ -135,24 +141,31 @@ fn main() -> Result<(), snafu::Whatever> {
     );
 
     // The remaining modes of operation (`--apply` returned above):
-    //   - dry-run:   drop to `nobody`, run the discovery, print results.
-    //   - --worker:  same as dry-run but emits JSON to stdout for the parent.
-    //   - default:   spawn the `--worker` child, read its JSON stdout, then
-    //                hand the winners to an `--apply` child that writes
+    //   - --worker:  drop to `nobody`, measure, emit JSON on stdout. Tested
+    //                first because a dry run forwards its own argv to the
+    //                worker it spawns, `--dry-run` and all.
+    //   - dry-run:   spawn that same worker — the measurements reach the
+    //                same hostile bytes either way — and simply never spawn
+    //                the `--apply` half.
+    //   - default:   spawn the worker, read its JSON stdout, then hand the
+    //                winners to an `--apply` child that writes
     //                `/etc/pacman.d/mirrorlist`.
     // The split keeps network I/O unprivileged while isolating the file
     // rewrite in a minimal privileged branch — one that, started from an
     // unprivileged parent, only comes into existence once the measurements
     // are over.
-    if dry_run {
-        run_dry_run(dl_k, ping_k, &country)
-    } else if worker {
+    if worker {
         run_worker(dl_k, ping_k, &country)
     } else {
         // Only a list we resolved ourselves needs injecting into the child's
         // argv; an explicit `-c` is already part of `env::args()`.
         let injected: &[CountryCode] = if auto_detected { &country } else { &[] };
-        run_update(&forwarded_args(injected))
+        let child_args = forwarded_args(injected);
+        if dry_run {
+            run_dry_run(dl_k, ping_k, &country, &child_args, !no_sandbox)
+        } else {
+            run_update(&child_args)
+        }
     }
 }
 
@@ -204,17 +217,37 @@ fn forwarded_args(injected: &[CountryCode]) -> Vec<String> {
 
 /// Runs the full discovery pipeline without writing anything.
 ///
-/// Drops to `nobody` only if invoked as root, so a non-privileged user can
-/// still `--dry-run` without needing sudo.
+/// Writing nothing makes this the harmless-looking mode, but it measures
+/// exactly what an update measures: the same `core.db` from the same
+/// unvetted mirror, through the same magic-byte-sniffed decompressor. So it
+/// earns the same sandbox — the worker is spawned under sudo just as an
+/// update spawns it, and the `--apply` half simply never happens.
+///
+/// `--no-sandbox` buys back the password prompt by measuring here instead,
+/// as the invoking user. Root needs neither: it can reach `setuid(nobody)`
+/// without a child, and `sudo pacrank --dry-run` has already paid for its
+/// privileges anyway.
 fn run_dry_run(
     dl_k: NonZeroUsize,
     ping_k: NonZeroUsize,
     countries: &[CountryCode],
+    child_args: &[String],
+    sandbox: bool,
 ) -> Result<(), snafu::Whatever> {
     if nix::unistd::Uid::effective().is_root() {
         drop_privileges()?;
+        pipeline::discover_best_mirrors(dl_k, ping_k, countries)?;
+    } else if sandbox {
+        // The winners are already on our stderr: the worker prints the
+        // per-mirror summary itself, and only the JSON goes down the pipe.
+        spawn_worker_and_read_mirrors(child_args, true)?;
+    } else {
+        tracing::warn!(
+            "--no-sandbox: measuring as you, not as 'nobody'. A hostile mirror's core.db \
+             is parsed with your privileges."
+        );
+        pipeline::discover_best_mirrors(dl_k, ping_k, countries)?;
     }
-    pipeline::discover_best_mirrors(dl_k, ping_k, countries)?;
     tracing::info!("Refusing to update the mirror list (dry run enabled)");
     Ok(())
 }
@@ -475,7 +508,21 @@ fn drop_privileges() -> Result<(), snafu::Whatever> {
 
 #[cfg(test)]
 mod test {
-    use super::validate_detect_threshold;
+    use clap::Parser as _;
+
+    use super::{Args, validate_detect_threshold};
+
+    /// `--no-sandbox` only describes what a dry run does; on an update the
+    /// worker is spawned by a parent that has to escalate for `--apply`
+    /// regardless, so skipping the sandbox would cost a password and buy
+    /// nothing. Silently ignoring it there would be the worse answer.
+    #[test]
+    fn no_sandbox_is_refused_outside_a_dry_run() {
+        Args::try_parse_from(["pacrank", "--no-sandbox"])
+            .expect_err("--no-sandbox must require --dry-run");
+        Args::try_parse_from(["pacrank", "--no-sandbox", "--dry-run"])
+            .expect("--no-sandbox belongs with --dry-run");
+    }
 
     #[test]
     fn positive_thresholds_pass() {
